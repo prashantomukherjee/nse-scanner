@@ -696,11 +696,177 @@ function RankedView({ rankedGainers, rankedLosers, scanning, progress, err, onRe
   );
 }
 
-function TabBar({ tab, setTab, gCount, lCount, rankedReady }) {
+/* Card showing a stock + its equity/future OHLC for the conviction view */
+function ConvictionCard({ entry, rank, isLoser, onClick }) {
+  const accent   = isLoser ? C.loss : C.gain;
+  const accentBg = isLoser ? C.lossBg : C.gainBg;
+  const stock = entry.stock;
+  const fut = entry.futOhlc;
+  const pct = stock.changePct ?? 0;
+
+  return (
+    <div onClick={onClick} style={{
+      background: C.card, border: `0.5px solid ${C.border}`,
+      borderRadius: "var(--border-radius-lg)", padding: "14px 16px",
+      cursor: "pointer", transition: "border-color 0.15s",
+    }}
+    onMouseEnter={e => e.currentTarget.style.borderColor = "var(--color-border-primary)"}
+    onMouseLeave={e => e.currentTarget.style.borderColor = "var(--color-border-tertiary)"}
+    >
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px", marginBottom: "8px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+          <div style={{
+            width: "30px", height: "30px", borderRadius: "50%", background: C.warnBg,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            fontSize: "12px", fontWeight: 500, color: C.warnText, flexShrink: 0,
+          }}>{rank}</div>
+          <div style={{ fontSize: "14px", fontWeight: 500, color: C.text }}>{stock.sym}</div>
+        </div>
+        <div style={{
+          background: accentBg, color: accent, borderRadius: "var(--border-radius-md)",
+          padding: "5px 11px", fontSize: "13px", fontWeight: 500, fontFamily: "var(--font-mono)",
+        }}>
+          {pct >= 0 ? "+" : ""}{pct.toFixed(2)}%
+        </div>
+      </div>
+
+      {/* Equity + Future OHLC side by side */}
+      <div style={{
+        display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px",
+        fontSize: "11px", fontFamily: "var(--font-mono)",
+      }}>
+        <div style={{
+          background: C.surface, borderRadius: "var(--border-radius-md)", padding: "8px 10px",
+        }}>
+          <div style={{ fontSize: "10px", color: C.hint, marginBottom: "3px", letterSpacing: "0.06em" }}>EQUITY</div>
+          <div style={{ color: C.muted }}>
+            O: <span style={{ color: accent, fontWeight: 500 }}>₹{fmtINR(stock.open)}</span>
+            &nbsp;·&nbsp;H: ₹{fmtINR(stock.high)}
+            &nbsp;·&nbsp;L: ₹{fmtINR(stock.low)}
+          </div>
+        </div>
+        <div style={{
+          background: C.surface, borderRadius: "var(--border-radius-md)", padding: "8px 10px",
+        }}>
+          <div style={{ fontSize: "10px", color: C.hint, marginBottom: "3px", letterSpacing: "0.06em" }}>FUTURE</div>
+          <div style={{ color: C.muted }}>
+            O: <span style={{ color: accent, fontWeight: 500 }}>₹{fmtINR(fut.open)}</span>
+            &nbsp;·&nbsp;H: ₹{fmtINR(fut.high)}
+            &nbsp;·&nbsp;L: ₹{fmtINR(fut.low)}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* The conviction tab content — equity AND future both open=low/high */
+function ConvictionView({ convictionGainers, convictionLosers, scanning, progress, err, onRetry, convictionTab, setConvictionTab, onSelect }) {
+  const list = convictionTab === "gainers" ? convictionGainers : convictionLosers;
+  const isLoser = convictionTab === "losers";
+
+  return (
+    <div>
+      {/* Sub-tabs */}
+      <div style={{ display: "flex", gap: "8px", marginBottom: "14px", fontFamily: "var(--font-mono)" }}>
+        {[
+          { id: "gainers", label: "▲ bullish (open=low)",  count: convictionGainers?.length },
+          { id: "losers",  label: "▼ bearish (open=high)", count: convictionLosers?.length },
+        ].map(t => (
+          <button key={t.id} onClick={() => setConvictionTab(t.id)} style={{
+            background: convictionTab === t.id ? C.warnBg : "transparent",
+            color: convictionTab === t.id ? C.warnText : C.muted,
+            border: `0.5px solid ${convictionTab === t.id ? C.warnText : C.border}`,
+            borderRadius: "var(--border-radius-md)",
+            padding: "5px 12px", fontSize: "12px",
+            fontWeight: convictionTab === t.id ? 500 : 400,
+            cursor: "pointer", display: "flex", alignItems: "center", gap: "6px",
+          }}>
+            {t.label}
+            {t.count != null && <span style={{ fontSize: "10px", opacity: 0.7 }}>({t.count})</span>}
+          </button>
+        ))}
+      </div>
+
+      {/* Description */}
+      <div style={{
+        fontSize: "11px", color: C.muted, fontFamily: "var(--font-mono)",
+        padding: "8px 12px", background: C.surface, borderRadius: "var(--border-radius-md)",
+        marginBottom: "10px", lineHeight: 1.5,
+      }}>
+        {isLoser
+          ? `Top 20 losers where BOTH equity AND its front-month future have open = day's high (strong bearish conviction — sellers from the top in both segments).`
+          : `Top 20 gainers where BOTH equity AND its front-month future have open = day's low (strong bullish conviction — buyers from the bottom in both segments).`}
+      </div>
+
+      {/* Error */}
+      {err && (
+        <div style={{
+          padding: "10px 14px", background: C.lossBg, color: C.loss,
+          borderRadius: "var(--border-radius-md)", fontSize: "12px", marginBottom: "1rem",
+          display: "flex", justifyContent: "space-between", alignItems: "center",
+          fontFamily: "var(--font-mono)",
+        }}>
+          <span>Error: {err}</span>
+          <button onClick={onRetry} style={{ fontSize: "11px", padding: "4px 10px", cursor: "pointer" }}>retry</button>
+        </div>
+      )}
+
+      {/* Progress */}
+      {scanning && (
+        <div style={{ fontFamily: "var(--font-mono)" }}>
+          <div style={{
+            fontSize: "11px", color: C.muted, marginBottom: "8px",
+            display: "flex", justifyContent: "space-between",
+          }}>
+            <span>fetching futures OHLC...</span>
+            <span>{progress.done} / {progress.total}</span>
+          </div>
+          <div style={{
+            height: "4px", background: C.surface,
+            borderRadius: "var(--border-radius-md)", overflow: "hidden", marginBottom: "12px",
+          }}>
+            <div style={{
+              width: `${progress.total ? (progress.done / progress.total) * 100 : 0}%`,
+              height: "100%", background: C.warnText, transition: "width 0.3s",
+            }} />
+          </div>
+        </div>
+      )}
+
+      {/* List */}
+      {list && !scanning && list.length === 0 && (
+        <div style={{
+          padding: "2rem 0", textAlign: "center", color: C.hint,
+          fontFamily: "var(--font-mono)", fontSize: "12px",
+        }}>
+          <div style={{ fontSize: "24px", marginBottom: "8px", opacity: 0.3 }}>—</div>
+          No {isLoser ? "bearish" : "bullish"} conviction signals in the top 20.
+          <div style={{ fontSize: "10px", marginTop: "4px" }}>
+            (no stock has both equity AND future opening at the {isLoser ? "high" : "low"})
+          </div>
+        </div>
+      )}
+
+      {list && !scanning && list.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+          {list.map((entry, i) => (
+            <ConvictionCard key={entry.stock.key} entry={entry} rank={i + 1}
+              isLoser={isLoser}
+              onClick={() => onSelect(entry.stock, isLoser ? "losers" : "gainers")} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TabBar({ tab, setTab, gCount, lCount, rankedReady, convictionReady }) {
   const tabs = [
-    { id: "gainers", label: "▲ gainers", color: C.gain,     bg: C.gainBg, count: gCount },
-    { id: "losers",  label: "▼ losers",  color: C.loss,     bg: C.lossBg, count: lCount },
-    { id: "ranked",  label: "◆ ranked",  color: C.infoText, bg: C.infoBg, count: rankedReady },
+    { id: "gainers",    label: "▲ gainers",      color: C.gain,     bg: C.gainBg, count: gCount },
+    { id: "losers",     label: "▼ losers",       color: C.loss,     bg: C.lossBg, count: lCount },
+    { id: "ranked",     label: "◆ ranked",       color: C.infoText, bg: C.infoBg, count: rankedReady },
+    { id: "conviction", label: "◇ open=low/high", color: C.warnText, bg: C.warnBg, count: convictionReady },
   ];
   return (
     <div style={{ display: "flex", borderBottom: `0.5px solid ${C.border}`, marginBottom: "1rem", fontFamily: "var(--font-mono)" }}>
@@ -733,6 +899,7 @@ export default function ScannerPage() {
   const [token,    setToken]    = useState("");
   const [showTokenPanel, setShowTokenPanel] = useState(true);
   const [universe, setUniverse] = useState(null);    // [{sym, key}, ...]
+  const [futuresMap, setFuturesMap] = useState(null); // { "underlyingKey|YYYY-MM": {instrumentKey, expiry, ...} }
   const [universeLoading, setUniverseLoading] = useState(true);
   const [universeErr, setUniverseErr] = useState(null);
   const [gainers,  setGainers]  = useState(null);
@@ -751,6 +918,14 @@ export default function ScannerPage() {
   const [rankedErr, setRankedErr] = useState(null);
   const [rankedTab, setRankedTab] = useState("gainers"); // sub-tab inside ranked
 
+  // Conviction tab state — equity AND future both open=low (bullish) or open=high (bearish)
+  const [convictionGainers, setConvictionGainers] = useState(null);
+  const [convictionLosers,  setConvictionLosers]  = useState(null);
+  const [convictionScanning, setConvictionScanning] = useState(false);
+  const [convictionProgress, setConvictionProgress] = useState({ done: 0, total: 0 });
+  const [convictionErr, setConvictionErr] = useState(null);
+  const [convictionTab, setConvictionTab] = useState("gainers");
+
   // Expiry selector — current and next month only
   const expiryOptions = getMonthlyExpiries();
   const [selectedExpiry, setSelectedExpiry] = useState(expiryOptions[0]);
@@ -767,6 +942,7 @@ export default function ScannerPage() {
       }
       const j = await res.json();
       setUniverse(j.stocks);
+      setFuturesMap(j.futures || {});
     } catch (e) {
       setUniverseErr(e.message);
     } finally {
@@ -783,6 +959,8 @@ export default function ScannerPage() {
     // Reset ranked data — it's stale once a fresh scan starts
     setRankedGainers(null); setRankedLosers(null); setRankedErr(null);
     setRankedProgress({ done: 0, total: 0 });
+    setConvictionGainers(null); setConvictionLosers(null); setConvictionErr(null);
+    setConvictionProgress({ done: 0, total: 0 });
     try {
       const keys = universe.map(s => s.key);
       const data = await fetchOhlc(keys, token);
@@ -875,6 +1053,110 @@ export default function ScannerPage() {
       runRankedScan();
     }
   }, [tab, gainers, losers, rankedGainers, rankedScanning, rankedErr, runRankedScan]);
+
+  // Conviction tab: find stocks where BOTH equity and its future have open=low (bullish) or open=high (bearish)
+  const runConvictionScan = useCallback(async () => {
+    if (!gainers || !losers || !token || !futuresMap) return;
+    if (convictionScanning) return;
+
+    setConvictionScanning(true);
+    setConvictionErr(null);
+
+    try {
+      // Always use the FRONT-MONTH future (current month, or next month if current has expired)
+      const today = new Date().toISOString().slice(0, 10);
+
+      // Helper: for a given underlying key, find the nearest non-expired futures contract
+      const findFrontMonthFuture = (underlyingKey) => {
+        // futuresMap is keyed as `underlyingKey|YYYY-MM` → { instrumentKey, expiry }
+        // Find all entries for this underlying that haven't expired
+        const candidates = Object.entries(futuresMap)
+          .filter(([k, v]) => k.startsWith(underlyingKey + "|") && v.expiry >= today)
+          .map(([_, v]) => v)
+          .sort((a, b) => a.expiry.localeCompare(b.expiry)); // earliest first
+        return candidates[0]?.instrumentKey || null;
+      };
+
+      // Build a list of all top-20 stocks and find their FRONT-MONTH future keys
+      const allStocks = [...gainers, ...losers].map((stock, i) => ({
+        stock,
+        isGainer: i < gainers.length,
+        futureKey: findFrontMonthFuture(stock.key),
+      }));
+
+      // Stocks without a future contract — can't be evaluated
+      const evaluable = allStocks.filter(s => s.futureKey);
+      const futureKeys = evaluable.map(s => s.futureKey);
+
+      setConvictionProgress({ done: 0, total: futureKeys.length });
+
+      if (futureKeys.length === 0) {
+        setConvictionGainers([]);
+        setConvictionLosers([]);
+        setConvictionScanning(false);
+        return;
+      }
+
+      // Fetch OHLC for all futures in one batched call
+      const futOhlc = await fetchOhlc(futureKeys, token);  // /v2/quotes returns ohlc.{open,high,low,close}
+
+      // Build a quick lookup: futureKey -> { open, high, low, close }
+      const futOhlcMap = {};
+      Object.values(futOhlc).forEach(item => {
+        const key = item.instrument_token;
+        const ohlc = item.ohlc || {};
+        futOhlcMap[key] = ohlc;
+      });
+
+      setConvictionProgress({ done: futureKeys.length, total: futureKeys.length });
+
+      // For each evaluable stock, check if equity AND future signal align
+      const gainerHits = [];
+      const loserHits = [];
+
+      for (const { stock, isGainer, futureKey } of evaluable) {
+        const futOhlc = futOhlcMap[futureKey];
+        if (!futOhlc || futOhlc.open == null) continue;
+
+        // Equity check (using stock's open/high/low we already have from scan)
+        if (stock.open == null) continue;
+
+        if (isGainer) {
+          // Bullish signal: BOTH equity and future have open === day's low
+          const equityOpenEqLow = Math.abs(stock.open - stock.low) < 0.01;
+          const futureOpenEqLow = Math.abs(futOhlc.open - futOhlc.low) < 0.01;
+          if (equityOpenEqLow && futureOpenEqLow) {
+            gainerHits.push({ stock, futOhlc });
+          }
+        } else {
+          // Bearish signal: BOTH equity and future have open === day's high
+          const equityOpenEqHigh = Math.abs(stock.open - stock.high) < 0.01;
+          const futureOpenEqHigh = Math.abs(futOhlc.open - futOhlc.high) < 0.01;
+          if (equityOpenEqHigh && futureOpenEqHigh) {
+            loserHits.push({ stock, futOhlc });
+          }
+        }
+      }
+
+      // Sort by % change magnitude (most extreme first)
+      gainerHits.sort((a, b) => b.stock.changePct - a.stock.changePct);
+      loserHits.sort((a, b) => a.stock.changePct - b.stock.changePct);
+
+      setConvictionGainers(gainerHits);
+      setConvictionLosers(loserHits);
+    } catch (e) {
+      setConvictionErr(e.message || "Conviction scan failed");
+    } finally {
+      setConvictionScanning(false);
+    }
+  }, [gainers, losers, token, futuresMap, convictionScanning]);
+
+  // Auto-trigger when user switches to conviction tab
+  useEffect(() => {
+    if (tab === "conviction" && gainers && losers && futuresMap && !convictionGainers && !convictionScanning && !convictionErr) {
+      runConvictionScan();
+    }
+  }, [tab, gainers, losers, futuresMap, convictionGainers, convictionScanning, convictionErr, runConvictionScan]);
 
   async function logout() {
     await fetch("/api/auth", { method: "DELETE" });
@@ -1006,10 +1288,11 @@ export default function ScannerPage() {
         <>
           <TabBar tab={tab} setTab={t => { setTab(t); setSelected(null); }}
             gCount={gainers?.length} lCount={losers?.length}
-            rankedReady={rankedGainers ? rankedGainers.length + (rankedLosers?.length || 0) : null} />
+            rankedReady={rankedGainers ? rankedGainers.length + (rankedLosers?.length || 0) : null}
+            convictionReady={convictionGainers ? convictionGainers.length + (convictionLosers?.length || 0) : null} />
 
           {/* Gainers / Losers tabs — simple list */}
-          {tab !== "ranked" && (
+          {(tab === "gainers" || tab === "losers") && (
             <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
               {activeList?.map((stock, i) => (
                 <StockCard key={stock.key} stock={stock} rank={i + 1}
@@ -1029,6 +1312,21 @@ export default function ScannerPage() {
               onRetry={runRankedScan}
               rankedTab={rankedTab}
               setRankedTab={setRankedTab}
+              onSelect={(stock, list) => setSelected({ stock, list })}
+            />
+          )}
+
+          {/* Conviction tab — equity AND future both open=low/high */}
+          {tab === "conviction" && (
+            <ConvictionView
+              convictionGainers={convictionGainers}
+              convictionLosers={convictionLosers}
+              scanning={convictionScanning}
+              progress={convictionProgress}
+              err={convictionErr}
+              onRetry={runConvictionScan}
+              convictionTab={convictionTab}
+              setConvictionTab={setConvictionTab}
               onSelect={(stock, list) => setSelected({ stock, list })}
             />
           )}
