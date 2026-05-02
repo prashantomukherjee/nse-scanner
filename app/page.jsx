@@ -149,7 +149,7 @@ async function countSignalsForStock(stock, expiryIso, token) {
   // 3. Anchor strike = nearest to today's open price
   const anchorPrice = stock.open ?? stock.high ?? stock.low ?? stock.ltp;
   const allStrikes = [...new Set(allChain.map(r => r.strike_price))].sort((a, b) => a - b);
-  if (allStrikes.length === 0) return { ceOpenEqLow: 0, ceOpenEqHigh: 0, peOpenEqLow: 0, peOpenEqHigh: 0 };
+  if (allStrikes.length === 0) return { ceOpenEqLow: 0, ceOpenEqHigh: 0, peOpenEqLow: 0, peOpenEqHigh: 0, pcr: null };
   const anchor = allStrikes.reduce((best, s) =>
     Math.abs(s - anchorPrice) < Math.abs(best - anchorPrice) ? s : best, allStrikes[0]);
   const anchorIdx = allStrikes.indexOf(anchor);
@@ -168,7 +168,7 @@ async function countSignalsForStock(stock, expiryIso, token) {
     if (r.call_options?.instrument_key) optKeys.push(r.call_options.instrument_key);
     if (r.put_options?.instrument_key)  optKeys.push(r.put_options.instrument_key);
   });
-  if (optKeys.length === 0) return { ceOpenEqLow: 0, ceOpenEqHigh: 0, peOpenEqLow: 0, peOpenEqHigh: 0 };
+  if (optKeys.length === 0) return { ceOpenEqLow: 0, ceOpenEqHigh: 0, peOpenEqLow: 0, peOpenEqHigh: 0, pcr: null };
 
   // 6. Fetch OHLC for all those options in one call
   const ohlcData = await fetchOptionOhlc(optKeys, token);
@@ -198,7 +198,54 @@ async function countSignalsForStock(stock, expiryIso, token) {
     tally(r.put_options,  "PE");
   }
 
-  return { ceOpenEqLow, ceOpenEqHigh, peOpenEqLow, peOpenEqHigh };
+  // Sum OI from chain data (available without extra API call)
+  let ceOi = 0, peOi = 0;
+  for (const r of selected) {
+    ceOi += r.call_options?.market_data?.oi || 0;
+    peOi += r.put_options?.market_data?.oi  || 0;
+  }
+  const pcr = ceOi > 0 ? peOi / ceOi : null;
+
+  return { ceOpenEqLow, ceOpenEqHigh, peOpenEqLow, peOpenEqHigh, pcr };
+}
+
+/*
+  Multi-factor conviction score (0–100) for a gainer or loser.
+
+  Factors & max weights:
+    40 pts — options signal count  (CE open=low + PE open=high for gainers; reverse for losers)
+    20 pts — equity open = day's low/high
+    15 pts — PCR confirmation  (low PCR = call-side dominance = bullish; high PCR = put-side = bearish)
+    25 pts — % change magnitude (capped at 5%)
+*/
+function computeConvictionScore(stock, signals, isGainer) {
+  let score = 0;
+
+  // 1. Options signal count (0–40 pts; 15 signals = full marks)
+  const sigCount = isGainer
+    ? (signals.ceOpenEqLow ?? 0) + (signals.peOpenEqHigh ?? 0)
+    : (signals.peOpenEqLow ?? 0) + (signals.ceOpenEqHigh ?? 0);
+  score += Math.min((sigCount / 15) * 40, 40);
+
+  // 2. Equity open = day's low (bullish) or high (bearish)
+  if (stock.open != null) {
+    const hit = isGainer
+      ? Math.abs(stock.open - (stock.low  ?? stock.open)) < 0.01
+      : Math.abs(stock.open - (stock.high ?? stock.open)) < 0.01;
+    if (hit) score += 20;
+  }
+
+  // 3. PCR: low PCR favours bulls, high PCR favours bears
+  const { pcr } = signals;
+  if (pcr != null) {
+    if (isGainer)  score += pcr < 0.8 ? 15 : pcr > 1.3 ? -5 : 0;
+    else           score += pcr > 1.2 ? 15 : pcr < 0.7 ? -5 : 0;
+  }
+
+  // 4. % change magnitude (0–25 pts; 5%+ = full marks)
+  score += Math.min((Math.abs(stock.changePct ?? 0) / 5) * 25, 25);
+
+  return Math.round(Math.min(Math.max(score, 0), 100));
 }
 
 /* ── Components ── */
@@ -611,10 +658,23 @@ function RankedCard({ entry, rank, isLoser, onClick }) {
           <div style={{ fontSize: "10px", color: C.muted }}>{secondaryLabel}</div>
           <div style={{ fontSize: "13px", fontWeight: 500, color: C.loss }}>{secondaryCount}</div>
         </div>
+        {signals.pcr != null && (
+          <div style={{ textAlign: "right" }}>
+            <div style={{ fontSize: "10px", color: C.muted }}>PCR</div>
+            <div style={{ fontSize: "13px", fontWeight: 500, color: signals.pcr > 1.2 ? C.loss : signals.pcr < 0.8 ? C.gain : C.muted }}>
+              {signals.pcr.toFixed(2)}
+            </div>
+          </div>
+        )}
         <div style={{
-          background: C.infoBg, color: C.infoText, borderRadius: "var(--border-radius-md)",
-          padding: "5px 11px", fontSize: "13px", fontWeight: 500, minWidth: "36px", textAlign: "center",
-        }}>{entry.score}</div>
+          borderRadius: "var(--border-radius-md)",
+          padding: "5px 11px", textAlign: "center", minWidth: "52px",
+          background: entry.score >= 70 ? C.gainBg : entry.score >= 40 ? C.warnBg : C.surface,
+          color:      entry.score >= 70 ? C.gain    : entry.score >= 40 ? C.warnText : C.hint,
+        }}>
+          <div style={{ fontSize: "13px", fontWeight: 500 }}>{entry.score}</div>
+          <div style={{ fontSize: "9px", opacity: 0.7, letterSpacing: "0.06em" }}>/ 100</div>
+        </div>
         <span style={{ color: C.hint, fontSize: "18px", lineHeight: 1 }}>›</span>
       </div>
     </div>
@@ -1164,11 +1224,7 @@ export default function ScannerPage() {
       const isGainer = i < gainers.length;
       try {
         const signals = await countSignalsForStock(stock, selectedExpiry.iso, token);
-        // For gainers (bullish): CE open=low + PE open=high
-        // For losers (bearish):  PE open=low + CE open=high
-        const score = isGainer
-          ? signals.ceOpenEqLow + signals.peOpenEqHigh
-          : signals.peOpenEqLow + signals.ceOpenEqHigh;
+        const score = computeConvictionScore(stock, signals, isGainer);
         results.set(stock.key, { stock, signals, score, isGainer });
       } catch (e) {
         // If one stock fails, log it but keep going
