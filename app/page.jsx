@@ -44,6 +44,12 @@ function moneyness(strike, spot) {
   return strike < spot ? "ITM" : "OTM";
 }
 
+function sendNotification(title, body) {
+  if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+    try { new Notification(title, { body }); } catch {}
+  }
+}
+
 /* ── Upstox API calls (all go through /api/upstox) ── */
 async function callUpstox(path, token) {
   let res;
@@ -481,6 +487,9 @@ function DetailPage({ stock, isLoser, token, selectedExpiry, onBack }) {
   const lowCnt  = chain?.filter(r => r.open != null && Math.abs(r.open - r.low)  < 0.01).length ?? 0;
   const highCnt = chain?.filter(r => r.open != null && Math.abs(r.open - r.high) < 0.01).length ?? 0;
   const strikesCnt = chain ? [...new Set(chain.map(r => r.strike))].length : 0;
+  const totalCeOi = chain?.filter(r => r.type === "CE").reduce((s, r) => s + (r.oi || 0), 0) ?? 0;
+  const totalPeOi = chain?.filter(r => r.type === "PE").reduce((s, r) => s + (r.oi || 0), 0) ?? 0;
+  const pcr = totalCeOi > 0 ? totalPeOi / totalCeOi : null;
 
   return (
     <div>
@@ -509,6 +518,11 @@ function DetailPage({ stock, isLoser, token, selectedExpiry, onBack }) {
           { label: "stock day low",   val: `₹${fmtINR(stock.low)}`,   color: C.loss },
           { label: "open = day low",  val: loading ? "…" : `${lowCnt} options`,  color: C.gain },
           { label: "open = day high", val: loading ? "…" : `${highCnt} options`, color: C.loss },
+          {
+            label: "PCR (PE OI / CE OI)",
+            val: loading ? "…" : pcr != null ? pcr.toFixed(2) : "—",
+            color: pcr == null ? C.hint : pcr > 1.2 ? C.loss : pcr < 0.8 ? C.gain : C.muted,
+          },
         ].map(m => (
           <div key={m.label} style={{ background: C.surface, borderRadius: "var(--border-radius-md)", padding: "10px 12px" }}>
             <div style={{ fontSize: "10px", color: C.hint, marginBottom: "3px", fontFamily: "var(--font-mono)" }}>{m.label}</div>
@@ -861,12 +875,107 @@ function ConvictionView({ convictionGainers, convictionLosers, scanning, progres
   );
 }
 
-function TabBar({ tab, setTab, gCount, lCount, rankedReady, convictionReady }) {
+function HistoryView({ history, onClear }) {
+  const [expanded, setExpanded] = useState(null);
+
+  if (history.length === 0) {
+    return (
+      <div style={{ padding: "4rem 0", textAlign: "center", color: C.hint, fontFamily: "var(--font-mono)" }}>
+        <div style={{ fontSize: "32px", marginBottom: "10px", opacity: 0.2 }}>⟳</div>
+        <div style={{ fontSize: "13px" }}>No scan history yet</div>
+        <div style={{ fontSize: "11px", marginTop: "4px" }}>Run a scan to start recording history</div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
+        <div style={{ fontSize: "11px", color: C.muted, fontFamily: "var(--font-mono)" }}>
+          {history.length} scan{history.length !== 1 ? "s" : ""} stored locally · last 10 kept
+        </div>
+        <button onClick={onClear} style={{ fontSize: "11px", padding: "4px 10px", cursor: "pointer", color: C.loss }}>
+          clear history
+        </button>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+        {history.map((entry, i) => {
+          const isOpen = expanded === i;
+          const ts = new Date(entry.ts).toLocaleString("en-IN", {
+            month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+          });
+          const top = entry.gainers[0];
+          const bot = entry.losers[0];
+          return (
+            <div key={entry.ts} style={{
+              background: C.card, border: `0.5px solid ${C.border}`,
+              borderRadius: "var(--border-radius-lg)", overflow: "hidden",
+            }}>
+              <div onClick={() => setExpanded(isOpen ? null : i)} style={{
+                padding: "12px 16px", cursor: "pointer", display: "flex",
+                alignItems: "center", justifyContent: "space-between",
+              }}>
+                <div style={{ fontFamily: "var(--font-mono)", fontSize: "12px", color: C.text }}>
+                  {i === 0 ? <span style={{ color: C.infoText, marginRight: "6px" }}>latest ·</span> : null}{ts}
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: "14px" }}>
+                  {top && (
+                    <span style={{ fontSize: "11px", color: C.gain, fontFamily: "var(--font-mono)" }}>
+                      ▲ {top.sym} +{top.changePct?.toFixed(2)}%
+                    </span>
+                  )}
+                  {bot && (
+                    <span style={{ fontSize: "11px", color: C.loss, fontFamily: "var(--font-mono)" }}>
+                      ▼ {bot.sym} {bot.changePct?.toFixed(2)}%
+                    </span>
+                  )}
+                  <span style={{ color: C.hint, fontSize: "14px" }}>{isOpen ? "∧" : "∨"}</span>
+                </div>
+              </div>
+              {isOpen && (
+                <div style={{
+                  padding: "0 16px 14px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px",
+                  borderTop: `0.5px solid ${C.border}`, paddingTop: "10px",
+                }}>
+                  <div>
+                    <div style={{ fontSize: "10px", color: C.hint, marginBottom: "6px", fontFamily: "var(--font-mono)", letterSpacing: "0.08em" }}>
+                      TOP GAINERS
+                    </div>
+                    {entry.gainers.slice(0, 5).map((s, j) => (
+                      <div key={s.sym} style={{ display: "flex", justifyContent: "space-between", padding: "3px 0", fontFamily: "var(--font-mono)", fontSize: "11px" }}>
+                        <span style={{ color: C.muted }}>{j + 1}. {s.sym}</span>
+                        <span style={{ color: C.gain }}>+{s.changePct?.toFixed(2)}%</span>
+                      </div>
+                    ))}
+                  </div>
+                  <div>
+                    <div style={{ fontSize: "10px", color: C.hint, marginBottom: "6px", fontFamily: "var(--font-mono)", letterSpacing: "0.08em" }}>
+                      TOP LOSERS
+                    </div>
+                    {entry.losers.slice(0, 5).map((s, j) => (
+                      <div key={s.sym} style={{ display: "flex", justifyContent: "space-between", padding: "3px 0", fontFamily: "var(--font-mono)", fontSize: "11px" }}>
+                        <span style={{ color: C.muted }}>{j + 1}. {s.sym}</span>
+                        <span style={{ color: C.loss }}>{s.changePct?.toFixed(2)}%</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function TabBar({ tab, setTab, gCount, lCount, rankedReady, convictionReady, historyCount }) {
   const tabs = [
-    { id: "gainers",    label: "▲ gainers",      color: C.gain,     bg: C.gainBg, count: gCount },
-    { id: "losers",     label: "▼ losers",       color: C.loss,     bg: C.lossBg, count: lCount },
-    { id: "ranked",     label: "◆ ranked",       color: C.infoText, bg: C.infoBg, count: rankedReady },
-    { id: "conviction", label: "◇ open=low/high", color: C.warnText, bg: C.warnBg, count: convictionReady },
+    { id: "gainers",    label: "▲ gainers",      color: C.gain,     bg: C.gainBg,  count: gCount },
+    { id: "losers",     label: "▼ losers",       color: C.loss,     bg: C.lossBg,  count: lCount },
+    { id: "ranked",     label: "◆ ranked",       color: C.infoText, bg: C.infoBg,  count: rankedReady },
+    { id: "conviction", label: "◇ open=low/high", color: C.warnText, bg: C.warnBg,  count: convictionReady },
+    { id: "history",    label: "⟳ history",      color: C.muted,    bg: C.surface, count: historyCount || null },
   ];
   return (
     <div style={{ display: "flex", borderBottom: `0.5px solid ${C.border}`, marginBottom: "1rem", fontFamily: "var(--font-mono)" }}>
@@ -929,6 +1038,39 @@ export default function ScannerPage() {
   // Expiry selector — current and next month only
   const expiryOptions = getMonthlyExpiries();
   const [selectedExpiry, setSelectedExpiry] = useState(expiryOptions[0]);
+
+  // Notification permission
+  const [notifPerm, setNotifPerm] = useState("default");
+  useEffect(() => {
+    if (typeof Notification !== "undefined") setNotifPerm(Notification.permission);
+  }, []);
+
+  // Scan history — persisted in localStorage
+  const [scanHistory, setScanHistory] = useState([]);
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("nse_scan_history");
+      if (saved) setScanHistory(JSON.parse(saved));
+    } catch {}
+  }, []);
+
+  function saveHistory(gainedList, lostList) {
+    const entry = {
+      ts: new Date().toISOString(),
+      gainers: gainedList.map(s => ({ sym: s.sym, ltp: s.ltp, changePct: s.changePct })),
+      losers:  lostList.map(s  => ({ sym: s.sym, ltp: s.ltp, changePct: s.changePct })),
+    };
+    setScanHistory(prev => {
+      const next = [entry, ...prev].slice(0, 10);
+      try { localStorage.setItem("nse_scan_history", JSON.stringify(next)); } catch {}
+      return next;
+    });
+  }
+
+  function clearHistory() {
+    setScanHistory([]);
+    try { localStorage.removeItem("nse_scan_history"); } catch {}
+  }
 
   // Fetch the F&O universe on mount
   const loadUniverse = useCallback(async () => {
@@ -995,6 +1137,7 @@ export default function ScannerPage() {
       setGainers(enriched.slice(0, 20));
       setLosers(enriched.slice(-20).reverse());
       setScannedAt(new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }));
+      saveHistory(enriched.slice(0, 20), enriched.slice(-20).reverse());
       setShowTokenPanel(false);
     } catch (e) {
       setScanErr(e.message || "Scan failed");
@@ -1045,6 +1188,15 @@ export default function ScannerPage() {
     setRankedGainers(rGainers);
     setRankedLosers(rLosers);
     setRankedScanning(false);
+    const topG = rGainers[0];
+    const topL = rLosers[0];
+    sendNotification(
+      "Ranked scan complete",
+      [
+        topG && `Bullish: ${topG.stock.sym} (score ${topG.score})`,
+        topL && `Bearish: ${topL.stock.sym} (score ${topL.score})`,
+      ].filter(Boolean).join(" · ") || "No signals found"
+    );
   }, [gainers, losers, token, selectedExpiry, rankedScanning]);
 
   // Auto-trigger ranked scan when user switches to Ranked tab and we don't have data yet
@@ -1144,6 +1296,13 @@ export default function ScannerPage() {
 
       setConvictionGainers(gainerHits);
       setConvictionLosers(loserHits);
+      sendNotification(
+        "Conviction scan complete",
+        [
+          gainerHits.length && `${gainerHits.length} bullish (open=low)`,
+          loserHits.length  && `${loserHits.length} bearish (open=high)`,
+        ].filter(Boolean).join(" · ") || "No conviction signals"
+      );
     } catch (e) {
       setConvictionErr(e.message || "Conviction scan failed");
     } finally {
@@ -1235,6 +1394,19 @@ export default function ScannerPage() {
             }}>
               {scanning ? "scanning..." : universeLoading ? "loading universe..." : "scan now ↗"}
             </button>
+            <button
+              onClick={() => {
+                if (typeof Notification === "undefined") return;
+                if (notifPerm === "granted") return;
+                Notification.requestPermission().then(p => setNotifPerm(p));
+              }}
+              title={notifPerm === "granted" ? "Notifications on" : notifPerm === "denied" ? "Notifications blocked in browser" : "Enable notifications"}
+              style={{
+                fontSize: "13px", padding: "5px 8px", cursor: notifPerm === "denied" ? "not-allowed" : "pointer",
+                opacity: notifPerm === "denied" ? 0.4 : 1,
+                color: notifPerm === "granted" ? C.gain : C.muted,
+              }}
+            >{notifPerm === "granted" ? "🔔" : "🔕"}</button>
             <button onClick={logout} style={{
               fontSize: "11px", padding: "5px 10px", cursor: "pointer", color: C.muted,
             }}>sign out</button>
@@ -1289,7 +1461,8 @@ export default function ScannerPage() {
           <TabBar tab={tab} setTab={t => { setTab(t); setSelected(null); }}
             gCount={gainers?.length} lCount={losers?.length}
             rankedReady={rankedGainers ? rankedGainers.length + (rankedLosers?.length || 0) : null}
-            convictionReady={convictionGainers ? convictionGainers.length + (convictionLosers?.length || 0) : null} />
+            convictionReady={convictionGainers ? convictionGainers.length + (convictionLosers?.length || 0) : null}
+            historyCount={scanHistory.length} />
 
           {/* Gainers / Losers tabs — simple list */}
           {(tab === "gainers" || tab === "losers") && (
@@ -1329,6 +1502,11 @@ export default function ScannerPage() {
               setConvictionTab={setConvictionTab}
               onSelect={(stock, list) => setSelected({ stock, list })}
             />
+          )}
+
+          {/* History tab — past scan results stored in localStorage */}
+          {tab === "history" && (
+            <HistoryView history={scanHistory} onClear={clearHistory} />
           )}
         </>
       )}
