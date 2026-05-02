@@ -255,11 +255,13 @@ function computeConvictionScore(stock, signals, isGainer) {
     if (hit) score += 20;
   }
 
-  // 3. PCR: low PCR favours bulls, high PCR favours bears
+  // 3. PCR — Indian F&O is writing-dominated so OI reflects writers, not buyers:
+  //    High CE OI (low PCR)  = call writers capping upside   = bearish
+  //    High PE OI (high PCR) = put writers supporting floor  = bullish
   const { pcr } = signals;
   if (pcr != null) {
-    if (isGainer)  score += pcr < 0.8 ? 15 : pcr > 1.3 ? -5 : 0;
-    else           score += pcr > 1.2 ? 15 : pcr < 0.7 ? -5 : 0;
+    if (isGainer)  score += pcr > 1.2 ? 15 : pcr < 0.7 ? -5 : 0;  // high PCR = put writers = floor support = bullish
+    else           score += pcr < 0.8 ? 15 : pcr > 1.3 ? -5 : 0;  // low PCR  = call writers = ceiling = bearish
   }
 
   // 4. % change magnitude (0–25 pts; 5%+ = full marks)
@@ -588,7 +590,7 @@ function DetailPage({ stock, isLoser, token, selectedExpiry, onBack }) {
           {
             label: "PCR (PE OI / CE OI)",
             val: loading ? "…" : pcr != null ? pcr.toFixed(2) : "—",
-            color: pcr == null ? C.hint : pcr > 1.2 ? C.loss : pcr < 0.8 ? C.gain : C.muted,
+            color: pcr == null ? C.hint : pcr > 1.2 ? C.gain : pcr < 0.8 ? C.loss : C.muted,
           },
         ].map(m => (
           <div key={m.label} style={{ background: C.surface, borderRadius: "var(--border-radius-md)", padding: "10px 12px" }}>
@@ -681,7 +683,7 @@ function RankedCard({ entry, rank, isLoser, onClick }) {
         {signals.pcr != null && (
           <div style={{ textAlign: "right" }}>
             <div style={{ fontSize: "10px", color: C.muted }}>PCR</div>
-            <div style={{ fontSize: "13px", fontWeight: 500, color: signals.pcr > 1.2 ? C.loss : signals.pcr < 0.8 ? C.gain : C.muted }}>
+            <div style={{ fontSize: "13px", fontWeight: 500, color: signals.pcr > 1.2 ? C.gain : signals.pcr < 0.8 ? C.loss : C.muted }}>
               {signals.pcr.toFixed(2)}
             </div>
           </div>
