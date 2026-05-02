@@ -175,27 +175,39 @@ async function countSignalsForStock(stock, expiryIso, token) {
   const ohlcByKey = {};
   Object.values(ohlcData).forEach(item => { ohlcByKey[item.instrument_token] = item; });
 
-  // 7. Count signals
+  // 7. Count signals with strike-distance weighting
+  //    Anchor (ATM) = 3 · OTM 1-5 strikes = 2 · OTM 6-10 strikes = 1.5 · ITM = 1
+  //    CE OTM = strike > anchor; PE OTM = strike < anchor
   let ceOpenEqLow = 0, ceOpenEqHigh = 0, peOpenEqLow = 0, peOpenEqHigh = 0;
+  let ceOpenLowScore = 0, ceOpenHighScore = 0, peOpenLowScore = 0, peOpenHighScore = 0;
 
-  const tally = (opt, type) => {
+  const strikeWeight = (strike, optType) => {
+    if (strike === anchor) return 3;
+    const dist = Math.abs(allStrikes.indexOf(strike) - anchorIdx);
+    const isOtm = optType === "CE" ? strike > anchor : strike < anchor;
+    if (isOtm) return dist <= 5 ? 2 : 1.5;
+    return 1; // ITM
+  };
+
+  const tally = (opt, strike, type) => {
     if (!opt?.instrument_key) return;
     const live = ohlcByKey[opt.instrument_key]?.live_ohlc;
     if (!live || live.open == null || live.low == null || live.high == null) return;
     const openEqLow  = Math.abs(live.open - live.low)  < 0.01;
     const openEqHigh = Math.abs(live.open - live.high) < 0.01;
+    const w = strikeWeight(strike, type);
     if (type === "CE") {
-      if (openEqLow)  ceOpenEqLow++;
-      if (openEqHigh) ceOpenEqHigh++;
+      if (openEqLow)  { ceOpenEqLow++;  ceOpenLowScore  += w; }
+      if (openEqHigh) { ceOpenEqHigh++; ceOpenHighScore += w; }
     } else {
-      if (openEqLow)  peOpenEqLow++;
-      if (openEqHigh) peOpenEqHigh++;
+      if (openEqLow)  { peOpenEqLow++;  peOpenLowScore  += w; }
+      if (openEqHigh) { peOpenEqHigh++; peOpenHighScore += w; }
     }
   };
 
   for (const r of selected) {
-    tally(r.call_options, "CE");
-    tally(r.put_options,  "PE");
+    tally(r.call_options, r.strike_price, "CE");
+    tally(r.put_options,  r.strike_price, "PE");
   }
 
   // Sum OI from chain data (available without extra API call)
@@ -206,26 +218,34 @@ async function countSignalsForStock(stock, expiryIso, token) {
   }
   const pcr = ceOi > 0 ? peOi / ceOi : null;
 
-  return { ceOpenEqLow, ceOpenEqHigh, peOpenEqLow, peOpenEqHigh, pcr };
+  return {
+    ceOpenEqLow, ceOpenEqHigh, peOpenEqLow, peOpenEqHigh, // raw counts (for display)
+    ceOpenLowScore, ceOpenHighScore, peOpenLowScore, peOpenHighScore, // weighted scores (for scoring)
+    pcr,
+  };
 }
 
 /*
   Multi-factor conviction score (0–100) for a gainer or loser.
 
   Factors & max weights:
-    40 pts — options signal count  (CE open=low + PE open=high for gainers; reverse for losers)
+    40 pts — weighted options signal score
+               Gainers: ceOpenLowScore + peOpenHighScore
+               Losers:  peOpenLowScore + ceOpenHighScore
+               Weights: anchor=3 · OTM 1-5=2 · OTM 6-10=1.5 · ITM=1
+               Normalised against a target of 20 weighted pts = full marks
     20 pts — equity open = day's low/high
-    15 pts — PCR confirmation  (low PCR = call-side dominance = bullish; high PCR = put-side = bearish)
+    15 pts — PCR confirmation (low = call-side bullish; high = put-side bearish)
     25 pts — % change magnitude (capped at 5%)
 */
 function computeConvictionScore(stock, signals, isGainer) {
   let score = 0;
 
-  // 1. Options signal count (0–40 pts; 15 signals = full marks)
-  const sigCount = isGainer
-    ? (signals.ceOpenEqLow ?? 0) + (signals.peOpenEqHigh ?? 0)
-    : (signals.peOpenEqLow ?? 0) + (signals.ceOpenEqHigh ?? 0);
-  score += Math.min((sigCount / 15) * 40, 40);
+  // 1. Weighted options signal score (0–40 pts; weighted score of 20 = full marks)
+  const weightedSig = isGainer
+    ? (signals.ceOpenLowScore  ?? 0) + (signals.peOpenHighScore ?? 0)
+    : (signals.peOpenLowScore  ?? 0) + (signals.ceOpenHighScore ?? 0);
+  score += Math.min((weightedSig / 20) * 40, 40);
 
   // 2. Equity open = day's low (bullish) or high (bearish)
   if (stock.open != null) {
