@@ -153,7 +153,7 @@ function detectVWAPCross(candles) {
 }
 
 // Run full technical analysis on one stock's intraday candles
-// Returns { close, ema20, ema200, vwap, cross, candles } — everything we need
+// Returns { close, ema20, ema50, vwap, cross, candles } — everything we need
 function analyzeIntraday(candles) {
   if (!candles || candles.length === 0) return null;
   // Upstox returns candles in DESCENDING order (newest first). Sort ascending so EMA/VWAP work correctly.
@@ -165,7 +165,7 @@ function analyzeIntraday(candles) {
   return {
     close: closes[closes.length - 1],
     ema20:  computeEMA(closes, 20),
-    ema200: computeEMA(closes, 200),
+    ema50:  computeEMA(closes, 50),
     vwap:   computeVWAP(sorted),
     cross:  detectVWAPCross(sorted),
     candleCount: sorted.length,
@@ -1004,7 +1004,7 @@ function TechnicalsCard({ entry, rank, isLoser, onClick }) {
       }}>
         {[
           { label: "20 EMA",  val: tech.ema20,  match: isLoser ? tech.close < tech.ema20 : tech.close > tech.ema20 },
-          { label: "200 EMA", val: tech.ema200, match: tech.ema200 == null ? null : (isLoser ? tech.close < tech.ema200 : tech.close > tech.ema200) },
+          { label: "50 EMA", val: tech.ema50, match: tech.ema50 == null ? null : (isLoser ? tech.close < tech.ema50 : tech.close > tech.ema50) },
           { label: "VWAP",    val: tech.vwap,   match: isLoser ? tech.close < tech.vwap : tech.close > tech.vwap },
           { label: "cross",   val: tech.cross === "above" ? "↑ up" : tech.cross === "below" ? "↓ down" : "—", match: tech.cross === (isLoser ? "below" : "above") },
         ].map(item => (
@@ -1059,8 +1059,8 @@ function TechnicalsView({ techGainers, techLosers, scanning, progress, err, onRe
         marginBottom: "10px", lineHeight: 1.5,
       }}>
         {isLoser
-          ? "Top 20 losers where price is below 20 EMA, below 200 EMA, AND just crossed BELOW VWAP on the 5-min chart (strong bearish technical setup)."
-          : "Top 20 gainers where price is above 20 EMA, above 200 EMA, AND just crossed ABOVE VWAP on the 5-min chart (strong bullish technical setup)."}
+          ? "Top 20 losers where price is below 20 EMA, below 50 EMA, AND just crossed BELOW VWAP on the 5-min chart (strong bearish technical setup)."
+          : "Top 20 gainers where price is above 20 EMA, above 50 EMA, AND just crossed ABOVE VWAP on the 5-min chart (strong bullish technical setup)."}
       </div>
 
       {/* Error */}
@@ -1107,7 +1107,7 @@ function TechnicalsView({ techGainers, techLosers, scanning, progress, err, onRe
           <div style={{ fontSize: "24px", marginBottom: "8px", opacity: 0.3 }}>—</div>
           No {isLoser ? "bearish" : "bullish"} technical signals in the top 20.
           <div style={{ fontSize: "10px", marginTop: "4px" }}>
-            (no stock has all 3 conditions: 20 EMA + 200 EMA + fresh VWAP cross)
+            (no stock has all 3 conditions: 20 EMA + 50 EMA + fresh VWAP cross)
           </div>
         </div>
       )}
@@ -1472,23 +1472,23 @@ export default function ScannerPage() {
 
         for (const r of results) {
           if (!r.tech) continue;
-          const { close, ema20, ema200, vwap, cross } = r.tech;
+          const { close, ema20, ema50, vwap, cross } = r.tech;
           if (close == null || vwap == null) continue;
 
           if (r.isGainer) {
-            // Bullish: above 20 EMA, above 200 EMA (if available), just crossed ABOVE VWAP
+            // Bullish: above 20 EMA, above 50 EMA, just crossed ABOVE VWAP
             const above20 = ema20 != null && close > ema20;
-            const above200 = ema200 == null || close > ema200; // if no 200 EMA yet, don't filter
+            const above50 = ema50 != null && close > ema50;
             const justCrossedUp = cross === "above";
-            if (above20 && above200 && justCrossedUp) {
+            if (above20 && above50 && justCrossedUp) {
               gainerHits.push({ stock: r.stock, tech: r.tech });
             }
           } else {
-            // Bearish: below 20 EMA, below 200 EMA (if available), just crossed BELOW VWAP
+            // Bearish: below 20 EMA, below 50 EMA, just crossed BELOW VWAP
             const below20 = ema20 != null && close < ema20;
-            const below200 = ema200 == null || close < ema200;
+            const below50 = ema50 != null && close < ema50;
             const justCrossedDown = cross === "below";
-            if (below20 && below200 && justCrossedDown) {
+            if (below20 && below50 && justCrossedDown) {
               loserHits.push({ stock: r.stock, tech: r.tech });
             }
           }
