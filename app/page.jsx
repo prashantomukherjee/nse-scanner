@@ -44,12 +44,6 @@ function moneyness(strike, spot) {
   return strike < spot ? "ITM" : "OTM";
 }
 
-function sendNotification(title, body) {
-  if (typeof Notification !== "undefined" && Notification.permission === "granted") {
-    try { new Notification(title, { body }); } catch {}
-  }
-}
-
 /* ── Upstox API calls (all go through /api/upstox) ── */
 async function callUpstox(path, token) {
   let res;
@@ -87,6 +81,95 @@ async function fetchOptionOhlc(keys, token) {
   // /v3/ohlc with interval=1d returns live_ohlc (today's intraday) AND prev_ohlc — needed for option open=low/high highlights
   const path = `/v3/market-quote/ohlc?instrument_key=${encodeURIComponent(keys.join(","))}&interval=1d`;
   return await callUpstox(path, token);
+}
+
+/* ── Technical analysis helpers ── */
+
+// Fetch 5-minute intraday candles for a single stock (today's session)
+// Upstox returns array of [timestamp, open, high, low, close, volume, oi]
+async function fetchIntradayCandles(instrumentKey, token, intervalMinutes = 5) {
+  const path = `/v3/historical-candle/intraday/${encodeURIComponent(instrumentKey)}/minutes/${intervalMinutes}`;
+  const data = await callUpstox(path, token);
+  return data?.candles || [];
+}
+
+// Compute Exponential Moving Average from an array of closing prices
+// Returns the last EMA value, or null if not enough data
+function computeEMA(closes, period) {
+  if (!closes || closes.length < period) return null;
+  const k = 2 / (period + 1);
+  // Seed with simple average of first `period` values
+  let ema = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < closes.length; i++) {
+    ema = closes[i] * k + ema * (1 - k);
+  }
+  return ema;
+}
+
+// Compute VWAP from candles
+// VWAP = sum(typical_price × volume) / sum(volume)
+// where typical_price = (high + low + close) / 3
+function computeVWAP(candles) {
+  if (!candles || candles.length === 0) return null;
+  let sumPV = 0, sumV = 0;
+  for (const c of candles) {
+    // candle structure: [timestamp, open, high, low, close, volume, oi]
+    const high = c[2], low = c[3], close = c[4], volume = c[5];
+    if (high == null || low == null || close == null || !volume) continue;
+    const typical = (high + low + close) / 3;
+    sumPV += typical * volume;
+    sumV += volume;
+  }
+  return sumV > 0 ? sumPV / sumV : null;
+}
+
+// Compute VWAP at a specific candle index (cumulative VWAP up to and including that candle)
+function computeVWAPAtIndex(candles, idx) {
+  if (idx < 0 || idx >= candles.length) return null;
+  return computeVWAP(candles.slice(0, idx + 1));
+}
+
+// Detect VWAP cross between last two candles
+// Returns 'above' if previous was below VWAP and current is above (bullish cross)
+//        'below' if previous was above VWAP and current is below (bearish cross)
+//        null   otherwise
+function detectVWAPCross(candles) {
+  if (!candles || candles.length < 2) return null;
+  const prev = candles[candles.length - 2];
+  const curr = candles[candles.length - 1];
+  const prevClose = prev[4], currClose = curr[4];
+  if (prevClose == null || currClose == null) return null;
+
+  const prevVWAP = computeVWAPAtIndex(candles, candles.length - 2);
+  const currVWAP = computeVWAPAtIndex(candles, candles.length - 1);
+  if (prevVWAP == null || currVWAP == null) return null;
+
+  const prevAbove = prevClose > prevVWAP;
+  const currAbove = currClose > currVWAP;
+
+  if (!prevAbove && currAbove) return "above"; // bullish cross
+  if (prevAbove && !currAbove) return "below"; // bearish cross
+  return null;
+}
+
+// Run full technical analysis on one stock's intraday candles
+// Returns { close, ema20, ema200, vwap, cross, candles } — everything we need
+function analyzeIntraday(candles) {
+  if (!candles || candles.length === 0) return null;
+  // Upstox returns candles in DESCENDING order (newest first). Sort ascending so EMA/VWAP work correctly.
+  const sorted = [...candles].sort((a, b) => new Date(a[0]) - new Date(b[0]));
+
+  const closes = sorted.map(c => c[4]).filter(v => v != null);
+  if (closes.length < 2) return null;
+
+  return {
+    close: closes[closes.length - 1],
+    ema20:  computeEMA(closes, 20),
+    ema200: computeEMA(closes, 200),
+    vwap:   computeVWAP(sorted),
+    cross:  detectVWAPCross(sorted),
+    candleCount: sorted.length,
+  };
 }
 
 /* ── Expiry helpers ── */
@@ -149,7 +232,7 @@ async function countSignalsForStock(stock, expiryIso, token) {
   // 3. Anchor strike = nearest to today's open price
   const anchorPrice = stock.open ?? stock.high ?? stock.low ?? stock.ltp;
   const allStrikes = [...new Set(allChain.map(r => r.strike_price))].sort((a, b) => a - b);
-  if (allStrikes.length === 0) return { ceOpenEqLow: 0, ceOpenEqHigh: 0, peOpenEqLow: 0, peOpenEqHigh: 0, pcr: null };
+  if (allStrikes.length === 0) return { ceOpenEqLow: 0, ceOpenEqHigh: 0, peOpenEqLow: 0, peOpenEqHigh: 0 };
   const anchor = allStrikes.reduce((best, s) =>
     Math.abs(s - anchorPrice) < Math.abs(best - anchorPrice) ? s : best, allStrikes[0]);
   const anchorIdx = allStrikes.indexOf(anchor);
@@ -168,106 +251,39 @@ async function countSignalsForStock(stock, expiryIso, token) {
     if (r.call_options?.instrument_key) optKeys.push(r.call_options.instrument_key);
     if (r.put_options?.instrument_key)  optKeys.push(r.put_options.instrument_key);
   });
-  if (optKeys.length === 0) return { ceOpenEqLow: 0, ceOpenEqHigh: 0, peOpenEqLow: 0, peOpenEqHigh: 0, pcr: null };
+  if (optKeys.length === 0) return { ceOpenEqLow: 0, ceOpenEqHigh: 0, peOpenEqLow: 0, peOpenEqHigh: 0 };
 
   // 6. Fetch OHLC for all those options in one call
   const ohlcData = await fetchOptionOhlc(optKeys, token);
   const ohlcByKey = {};
   Object.values(ohlcData).forEach(item => { ohlcByKey[item.instrument_token] = item; });
 
-  // 7. Count signals with strike-distance weighting
-  //    Anchor (ATM) = 3 · OTM 1-5 strikes = 2 · OTM 6-10 strikes = 1.5 · ITM = 1
-  //    CE OTM = strike > anchor; PE OTM = strike < anchor
+  // 7. Count signals
   let ceOpenEqLow = 0, ceOpenEqHigh = 0, peOpenEqLow = 0, peOpenEqHigh = 0;
-  let ceOpenLowScore = 0, ceOpenHighScore = 0, peOpenLowScore = 0, peOpenHighScore = 0;
 
-  const strikeWeight = (strike, optType) => {
-    if (strike === anchor) return 3;
-    const dist = Math.abs(allStrikes.indexOf(strike) - anchorIdx);
-    const isOtm = optType === "CE" ? strike > anchor : strike < anchor;
-    if (isOtm) return dist <= 5 ? 2 : 1.5;
-    return 1; // ITM
-  };
-
-  const tally = (opt, strike, type) => {
+  const tally = (opt, type) => {
     if (!opt?.instrument_key) return;
     const live = ohlcByKey[opt.instrument_key]?.live_ohlc;
     if (!live || live.open == null || live.low == null || live.high == null) return;
+    // Skip dead strikes — high === low means no real trading happened
+    if (Math.abs(live.high - live.low) < 0.01) return;
     const openEqLow  = Math.abs(live.open - live.low)  < 0.01;
     const openEqHigh = Math.abs(live.open - live.high) < 0.01;
-    const w = strikeWeight(strike, type);
     if (type === "CE") {
-      if (openEqLow)  { ceOpenEqLow++;  ceOpenLowScore  += w; }
-      if (openEqHigh) { ceOpenEqHigh++; ceOpenHighScore += w; }
+      if (openEqLow)  ceOpenEqLow++;
+      if (openEqHigh) ceOpenEqHigh++;
     } else {
-      if (openEqLow)  { peOpenEqLow++;  peOpenLowScore  += w; }
-      if (openEqHigh) { peOpenEqHigh++; peOpenHighScore += w; }
+      if (openEqLow)  peOpenEqLow++;
+      if (openEqHigh) peOpenEqHigh++;
     }
   };
 
   for (const r of selected) {
-    tally(r.call_options, r.strike_price, "CE");
-    tally(r.put_options,  r.strike_price, "PE");
+    tally(r.call_options, "CE");
+    tally(r.put_options,  "PE");
   }
 
-  // Sum OI from chain data (available without extra API call)
-  let ceOi = 0, peOi = 0;
-  for (const r of selected) {
-    ceOi += r.call_options?.market_data?.oi || 0;
-    peOi += r.put_options?.market_data?.oi  || 0;
-  }
-  const pcr = ceOi > 0 ? peOi / ceOi : null;
-
-  return {
-    ceOpenEqLow, ceOpenEqHigh, peOpenEqLow, peOpenEqHigh, // raw counts (for display)
-    ceOpenLowScore, ceOpenHighScore, peOpenLowScore, peOpenHighScore, // weighted scores (for scoring)
-    pcr,
-  };
-}
-
-/*
-  Multi-factor conviction score (0–100) for a gainer or loser.
-
-  Factors & max weights:
-    40 pts — weighted options signal score
-               Gainers: ceOpenLowScore + peOpenHighScore
-               Losers:  peOpenLowScore + ceOpenHighScore
-               Weights: anchor=3 · OTM 1-5=2 · OTM 6-10=1.5 · ITM=1
-               Normalised against a target of 20 weighted pts = full marks
-    20 pts — equity open = day's low/high
-    15 pts — PCR confirmation (low = call-side bullish; high = put-side bearish)
-    25 pts — % change magnitude (capped at 5%)
-*/
-function computeConvictionScore(stock, signals, isGainer) {
-  let score = 0;
-
-  // 1. Weighted options signal score (0–40 pts; weighted score of 20 = full marks)
-  const weightedSig = isGainer
-    ? (signals.ceOpenLowScore  ?? 0) + (signals.peOpenHighScore ?? 0)
-    : (signals.peOpenLowScore  ?? 0) + (signals.ceOpenHighScore ?? 0);
-  score += Math.min((weightedSig / 20) * 40, 40);
-
-  // 2. Equity open = day's low (bullish) or high (bearish)
-  if (stock.open != null) {
-    const hit = isGainer
-      ? Math.abs(stock.open - (stock.low  ?? stock.open)) < 0.01
-      : Math.abs(stock.open - (stock.high ?? stock.open)) < 0.01;
-    if (hit) score += 20;
-  }
-
-  // 3. PCR — Indian F&O is writing-dominated so OI reflects writers, not buyers:
-  //    High CE OI (low PCR)  = call writers capping upside   = bearish
-  //    High PE OI (high PCR) = put writers supporting floor  = bullish
-  const { pcr } = signals;
-  if (pcr != null) {
-    if (isGainer)  score += pcr > 1.2 ? 15 : pcr < 0.7 ? -5 : 0;  // high PCR = put writers = floor support = bullish
-    else           score += pcr < 0.8 ? 15 : pcr > 1.3 ? -5 : 0;  // low PCR  = call writers = ceiling = bearish
-  }
-
-  // 4. % change magnitude (0–25 pts; 5%+ = full marks)
-  score += Math.min((Math.abs(stock.changePct ?? 0) / 5) * 25, 25);
-
-  return Math.round(Math.min(Math.max(score, 0), 100));
+  return { ceOpenEqLow, ceOpenEqHigh, peOpenEqLow, peOpenEqHigh };
 }
 
 /* ── Components ── */
@@ -385,6 +401,10 @@ function OptionsChain({ rows }) {
   }
   function highlight(opt) {
     if (!opt || opt.open == null) return null;
+    // Skip dead strikes — if open, high, and low are ALL equal, the option didn't really trade
+    // (or had only one trade), so the open=low / open=high signal is meaningless
+    if (opt.high != null && opt.low != null
+        && Math.abs(opt.high - opt.low) < 0.01) return null;
     if (Math.abs(opt.open - opt.low)  < 0.01) return "low";
     if (Math.abs(opt.open - opt.high) < 0.01) return "high";
     return null;
@@ -553,12 +573,11 @@ function DetailPage({ stock, isLoser, token, selectedExpiry, onBack }) {
 
   useEffect(() => { loadChain(); }, [loadChain]);
 
-  const lowCnt  = chain?.filter(r => r.open != null && Math.abs(r.open - r.low)  < 0.01).length ?? 0;
-  const highCnt = chain?.filter(r => r.open != null && Math.abs(r.open - r.high) < 0.01).length ?? 0;
+  // Skip dead strikes — options where high === low never really traded
+  const isLive = (r) => r.open != null && r.high != null && r.low != null && Math.abs(r.high - r.low) >= 0.01;
+  const lowCnt  = chain?.filter(r => isLive(r) && Math.abs(r.open - r.low)  < 0.01).length ?? 0;
+  const highCnt = chain?.filter(r => isLive(r) && Math.abs(r.open - r.high) < 0.01).length ?? 0;
   const strikesCnt = chain ? [...new Set(chain.map(r => r.strike))].length : 0;
-  const totalCeOi = chain?.filter(r => r.type === "CE").reduce((s, r) => s + (r.oi || 0), 0) ?? 0;
-  const totalPeOi = chain?.filter(r => r.type === "PE").reduce((s, r) => s + (r.oi || 0), 0) ?? 0;
-  const pcr = totalCeOi > 0 ? totalPeOi / totalCeOi : null;
 
   return (
     <div>
@@ -587,11 +606,6 @@ function DetailPage({ stock, isLoser, token, selectedExpiry, onBack }) {
           { label: "stock day low",   val: `₹${fmtINR(stock.low)}`,   color: C.loss },
           { label: "open = day low",  val: loading ? "…" : `${lowCnt} options`,  color: C.gain },
           { label: "open = day high", val: loading ? "…" : `${highCnt} options`, color: C.loss },
-          {
-            label: "PCR (PE OI / CE OI)",
-            val: loading ? "…" : pcr != null ? pcr.toFixed(2) : "—",
-            color: pcr == null ? C.hint : pcr > 1.2 ? C.gain : pcr < 0.8 ? C.loss : C.muted,
-          },
         ].map(m => (
           <div key={m.label} style={{ background: C.surface, borderRadius: "var(--border-radius-md)", padding: "10px 12px" }}>
             <div style={{ fontSize: "10px", color: C.hint, marginBottom: "3px", fontFamily: "var(--font-mono)" }}>{m.label}</div>
@@ -680,23 +694,10 @@ function RankedCard({ entry, rank, isLoser, onClick }) {
           <div style={{ fontSize: "10px", color: C.muted }}>{secondaryLabel}</div>
           <div style={{ fontSize: "13px", fontWeight: 500, color: C.loss }}>{secondaryCount}</div>
         </div>
-        {signals.pcr != null && (
-          <div style={{ textAlign: "right" }}>
-            <div style={{ fontSize: "10px", color: C.muted }}>PCR</div>
-            <div style={{ fontSize: "13px", fontWeight: 500, color: signals.pcr > 1.2 ? C.gain : signals.pcr < 0.8 ? C.loss : C.muted }}>
-              {signals.pcr.toFixed(2)}
-            </div>
-          </div>
-        )}
         <div style={{
-          borderRadius: "var(--border-radius-md)",
-          padding: "5px 11px", textAlign: "center", minWidth: "52px",
-          background: entry.score >= 70 ? C.gainBg : entry.score >= 40 ? C.warnBg : C.surface,
-          color:      entry.score >= 70 ? C.gain    : entry.score >= 40 ? C.warnText : C.hint,
-        }}>
-          <div style={{ fontSize: "13px", fontWeight: 500 }}>{entry.score}</div>
-          <div style={{ fontSize: "9px", opacity: 0.7, letterSpacing: "0.06em" }}>/ 100</div>
-        </div>
+          background: C.infoBg, color: C.infoText, borderRadius: "var(--border-radius-md)",
+          padding: "5px 11px", fontSize: "13px", fontWeight: 500, minWidth: "36px", textAlign: "center",
+        }}>{entry.score}</div>
         <span style={{ color: C.hint, fontSize: "18px", lineHeight: 1 }}>›</span>
       </div>
     </div>
@@ -957,107 +958,181 @@ function ConvictionView({ convictionGainers, convictionLosers, scanning, progres
   );
 }
 
-function HistoryView({ history, onClear }) {
-  const [expanded, setExpanded] = useState(null);
-
-  if (history.length === 0) {
-    return (
-      <div style={{ padding: "4rem 0", textAlign: "center", color: C.hint, fontFamily: "var(--font-mono)" }}>
-        <div style={{ fontSize: "32px", marginBottom: "10px", opacity: 0.2 }}>⟳</div>
-        <div style={{ fontSize: "13px" }}>No scan history yet</div>
-        <div style={{ fontSize: "11px", marginTop: "4px" }}>Run a scan to start recording history</div>
-      </div>
-    );
-  }
+/* Card showing a stock with its technicals (EMA, VWAP, cross signal) */
+function TechnicalsCard({ entry, rank, isLoser, onClick }) {
+  const accent   = isLoser ? C.loss : C.gain;
+  const accentBg = isLoser ? C.lossBg : C.gainBg;
+  const stock = entry.stock;
+  const tech = entry.tech;
+  const pct = stock.changePct ?? 0;
 
   return (
-    <div>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
-        <div style={{ fontSize: "11px", color: C.muted, fontFamily: "var(--font-mono)" }}>
-          {history.length} scan{history.length !== 1 ? "s" : ""} stored locally · last 10 kept
-        </div>
-        <button onClick={onClear} style={{ fontSize: "11px", padding: "4px 10px", cursor: "pointer", color: C.loss }}>
-          clear history
-        </button>
-      </div>
-      <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-        {history.map((entry, i) => {
-          const isOpen = expanded === i;
-          const ts = new Date(entry.ts).toLocaleString("en-IN", {
-            month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
-          });
-          const top = entry.gainers[0];
-          const bot = entry.losers[0];
-          return (
-            <div key={entry.ts} style={{
-              background: C.card, border: `0.5px solid ${C.border}`,
-              borderRadius: "var(--border-radius-lg)", overflow: "hidden",
-            }}>
-              <div onClick={() => setExpanded(isOpen ? null : i)} style={{
-                padding: "12px 16px", cursor: "pointer", display: "flex",
-                alignItems: "center", justifyContent: "space-between",
-              }}>
-                <div style={{ fontFamily: "var(--font-mono)", fontSize: "12px", color: C.text }}>
-                  {i === 0 ? <span style={{ color: C.infoText, marginRight: "6px" }}>latest ·</span> : null}{ts}
-                </div>
-                <div style={{ display: "flex", alignItems: "center", gap: "14px" }}>
-                  {top && (
-                    <span style={{ fontSize: "11px", color: C.gain, fontFamily: "var(--font-mono)" }}>
-                      ▲ {top.sym} +{top.changePct?.toFixed(2)}%
-                    </span>
-                  )}
-                  {bot && (
-                    <span style={{ fontSize: "11px", color: C.loss, fontFamily: "var(--font-mono)" }}>
-                      ▼ {bot.sym} {bot.changePct?.toFixed(2)}%
-                    </span>
-                  )}
-                  <span style={{ color: C.hint, fontSize: "14px" }}>{isOpen ? "∧" : "∨"}</span>
-                </div>
-              </div>
-              {isOpen && (
-                <div style={{
-                  padding: "0 16px 14px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px",
-                  borderTop: `0.5px solid ${C.border}`, paddingTop: "10px",
-                }}>
-                  <div>
-                    <div style={{ fontSize: "10px", color: C.hint, marginBottom: "6px", fontFamily: "var(--font-mono)", letterSpacing: "0.08em" }}>
-                      TOP GAINERS
-                    </div>
-                    {entry.gainers.slice(0, 5).map((s, j) => (
-                      <div key={s.sym} style={{ display: "flex", justifyContent: "space-between", padding: "3px 0", fontFamily: "var(--font-mono)", fontSize: "11px" }}>
-                        <span style={{ color: C.muted }}>{j + 1}. {s.sym}</span>
-                        <span style={{ color: C.gain }}>+{s.changePct?.toFixed(2)}%</span>
-                      </div>
-                    ))}
-                  </div>
-                  <div>
-                    <div style={{ fontSize: "10px", color: C.hint, marginBottom: "6px", fontFamily: "var(--font-mono)", letterSpacing: "0.08em" }}>
-                      TOP LOSERS
-                    </div>
-                    {entry.losers.slice(0, 5).map((s, j) => (
-                      <div key={s.sym} style={{ display: "flex", justifyContent: "space-between", padding: "3px 0", fontFamily: "var(--font-mono)", fontSize: "11px" }}>
-                        <span style={{ color: C.muted }}>{j + 1}. {s.sym}</span>
-                        <span style={{ color: C.loss }}>{s.changePct?.toFixed(2)}%</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
+    <div onClick={onClick} style={{
+      background: C.card, border: `0.5px solid ${C.border}`,
+      borderRadius: "var(--border-radius-lg)", padding: "14px 16px",
+      cursor: "pointer", transition: "border-color 0.15s",
+    }}
+    onMouseEnter={e => e.currentTarget.style.borderColor = "var(--color-border-primary)"}
+    onMouseLeave={e => e.currentTarget.style.borderColor = "var(--color-border-tertiary)"}
+    >
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px", marginBottom: "8px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+          <div style={{
+            width: "30px", height: "30px", borderRadius: "50%", background: C.surface,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            fontSize: "12px", fontWeight: 500, color: C.text, flexShrink: 0,
+          }}>{rank}</div>
+          <div>
+            <div style={{ fontSize: "14px", fontWeight: 500, color: C.text }}>{stock.sym}</div>
+            <div style={{ fontSize: "11px", color: C.muted, marginTop: "2px", fontFamily: "var(--font-mono)" }}>
+              ₹{fmtINR(tech.close)}
             </div>
-          );
-        })}
+          </div>
+        </div>
+        <div style={{
+          background: accentBg, color: accent, borderRadius: "var(--border-radius-md)",
+          padding: "5px 11px", fontSize: "13px", fontWeight: 500, fontFamily: "var(--font-mono)",
+        }}>
+          {pct >= 0 ? "+" : ""}{pct.toFixed(2)}%
+        </div>
+      </div>
+
+      {/* Technicals values */}
+      <div style={{
+        display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: "6px",
+        fontSize: "11px", fontFamily: "var(--font-mono)",
+      }}>
+        {[
+          { label: "20 EMA",  val: tech.ema20,  match: isLoser ? tech.close < tech.ema20 : tech.close > tech.ema20 },
+          { label: "200 EMA", val: tech.ema200, match: tech.ema200 == null ? null : (isLoser ? tech.close < tech.ema200 : tech.close > tech.ema200) },
+          { label: "VWAP",    val: tech.vwap,   match: isLoser ? tech.close < tech.vwap : tech.close > tech.vwap },
+          { label: "cross",   val: tech.cross === "above" ? "↑ up" : tech.cross === "below" ? "↓ down" : "—", match: tech.cross === (isLoser ? "below" : "above") },
+        ].map(item => (
+          <div key={item.label} style={{
+            background: item.match ? accentBg : C.surface,
+            color: item.match ? accent : C.muted,
+            borderRadius: "var(--border-radius-md)", padding: "6px 8px",
+          }}>
+            <div style={{ fontSize: "9px", opacity: 0.7, letterSpacing: "0.06em", marginBottom: "2px" }}>{item.label}</div>
+            <div style={{ fontSize: "12px", fontWeight: 500 }}>
+              {typeof item.val === "number" ? `₹${fmtINR(item.val)}` : (item.val ?? "—")}
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   );
 }
 
-function TabBar({ tab, setTab, gCount, lCount, rankedReady, convictionReady, historyCount }) {
+/* The technicals tab content — sub-tabs (gainers/losers) + filtered list */
+function TechnicalsView({ techGainers, techLosers, scanning, progress, err, onRetry, techTab, setTechTab, onSelect }) {
+  const list = techTab === "gainers" ? techGainers : techLosers;
+  const isLoser = techTab === "losers";
+
+  return (
+    <div>
+      {/* Sub-tabs */}
+      <div style={{ display: "flex", gap: "8px", marginBottom: "14px", fontFamily: "var(--font-mono)" }}>
+        {[
+          { id: "gainers", label: "▲ bullish technicals", count: techGainers?.length },
+          { id: "losers",  label: "▼ bearish technicals", count: techLosers?.length },
+        ].map(t => (
+          <button key={t.id} onClick={() => setTechTab(t.id)} style={{
+            background: techTab === t.id ? C.surface : "transparent",
+            color: techTab === t.id ? C.text : C.muted,
+            border: `0.5px solid ${techTab === t.id ? C.text : C.border}`,
+            borderRadius: "var(--border-radius-md)",
+            padding: "5px 12px", fontSize: "12px",
+            fontWeight: techTab === t.id ? 500 : 400,
+            cursor: "pointer", display: "flex", alignItems: "center", gap: "6px",
+          }}>
+            {t.label}
+            {t.count != null && <span style={{ fontSize: "10px", opacity: 0.7 }}>({t.count})</span>}
+          </button>
+        ))}
+      </div>
+
+      {/* Description */}
+      <div style={{
+        fontSize: "11px", color: C.muted, fontFamily: "var(--font-mono)",
+        padding: "8px 12px", background: C.surface, borderRadius: "var(--border-radius-md)",
+        marginBottom: "10px", lineHeight: 1.5,
+      }}>
+        {isLoser
+          ? "Top 20 losers where price is below 20 EMA, below 200 EMA, AND just crossed BELOW VWAP on the 5-min chart (strong bearish technical setup)."
+          : "Top 20 gainers where price is above 20 EMA, above 200 EMA, AND just crossed ABOVE VWAP on the 5-min chart (strong bullish technical setup)."}
+      </div>
+
+      {/* Error */}
+      {err && (
+        <div style={{
+          padding: "10px 14px", background: C.lossBg, color: C.loss,
+          borderRadius: "var(--border-radius-md)", fontSize: "12px", marginBottom: "1rem",
+          display: "flex", justifyContent: "space-between", alignItems: "center",
+          fontFamily: "var(--font-mono)",
+        }}>
+          <span>Error: {err}</span>
+          <button onClick={onRetry} style={{ fontSize: "11px", padding: "4px 10px", cursor: "pointer" }}>retry</button>
+        </div>
+      )}
+
+      {/* Progress */}
+      {scanning && (
+        <div style={{ fontFamily: "var(--font-mono)" }}>
+          <div style={{
+            fontSize: "11px", color: C.muted, marginBottom: "8px",
+            display: "flex", justifyContent: "space-between",
+          }}>
+            <span>fetching 5-min candles for technical analysis...</span>
+            <span>{progress.done} / {progress.total}</span>
+          </div>
+          <div style={{
+            height: "4px", background: C.surface,
+            borderRadius: "var(--border-radius-md)", overflow: "hidden", marginBottom: "12px",
+          }}>
+            <div style={{
+              width: `${progress.total ? (progress.done / progress.total) * 100 : 0}%`,
+              height: "100%", background: C.text, transition: "width 0.3s",
+            }} />
+          </div>
+        </div>
+      )}
+
+      {/* Empty state */}
+      {list && !scanning && list.length === 0 && (
+        <div style={{
+          padding: "2rem 0", textAlign: "center", color: C.hint,
+          fontFamily: "var(--font-mono)", fontSize: "12px",
+        }}>
+          <div style={{ fontSize: "24px", marginBottom: "8px", opacity: 0.3 }}>—</div>
+          No {isLoser ? "bearish" : "bullish"} technical signals in the top 20.
+          <div style={{ fontSize: "10px", marginTop: "4px" }}>
+            (no stock has all 3 conditions: 20 EMA + 200 EMA + fresh VWAP cross)
+          </div>
+        </div>
+      )}
+
+      {/* List */}
+      {list && !scanning && list.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+          {list.map((entry, i) => (
+            <TechnicalsCard key={entry.stock.key} entry={entry} rank={i + 1}
+              isLoser={isLoser}
+              onClick={() => onSelect(entry.stock, isLoser ? "losers" : "gainers")} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TabBar({ tab, setTab, gCount, lCount, rankedReady, convictionReady, techReady }) {
   const tabs = [
-    { id: "gainers",    label: "▲ gainers",      color: C.gain,     bg: C.gainBg,  count: gCount },
-    { id: "losers",     label: "▼ losers",       color: C.loss,     bg: C.lossBg,  count: lCount },
-    { id: "ranked",     label: "◆ ranked",       color: C.infoText, bg: C.infoBg,  count: rankedReady },
-    { id: "conviction", label: "◇ open=low/high", color: C.warnText, bg: C.warnBg,  count: convictionReady },
-    { id: "history",    label: "⟳ history",      color: C.muted,    bg: C.surface, count: historyCount || null },
+    { id: "gainers",    label: "▲ gainers",       color: C.gain,     bg: C.gainBg, count: gCount },
+    { id: "losers",     label: "▼ losers",        color: C.loss,     bg: C.lossBg, count: lCount },
+    { id: "ranked",     label: "◆ ranked",        color: C.infoText, bg: C.infoBg, count: rankedReady },
+    { id: "conviction", label: "◇ open=low/high", color: C.warnText, bg: C.warnBg, count: convictionReady },
+    { id: "technicals", label: "◈ technicals",    color: C.text,     bg: C.surface, count: techReady },
   ];
   return (
     <div style={{ display: "flex", borderBottom: `0.5px solid ${C.border}`, marginBottom: "1rem", fontFamily: "var(--font-mono)" }}>
@@ -1117,42 +1192,17 @@ export default function ScannerPage() {
   const [convictionErr, setConvictionErr] = useState(null);
   const [convictionTab, setConvictionTab] = useState("gainers");
 
+  // Technicals tab state — EMA 20/200 + VWAP cross filtering
+  const [techGainers, setTechGainers] = useState(null);
+  const [techLosers,  setTechLosers]  = useState(null);
+  const [techScanning, setTechScanning] = useState(false);
+  const [techProgress, setTechProgress] = useState({ done: 0, total: 0 });
+  const [techErr, setTechErr] = useState(null);
+  const [techTab, setTechTab] = useState("gainers");
+
   // Expiry selector — current and next month only
   const expiryOptions = getMonthlyExpiries();
   const [selectedExpiry, setSelectedExpiry] = useState(expiryOptions[0]);
-
-  // Notification permission
-  const [notifPerm, setNotifPerm] = useState("default");
-  useEffect(() => {
-    if (typeof Notification !== "undefined") setNotifPerm(Notification.permission);
-  }, []);
-
-  // Scan history — persisted in localStorage
-  const [scanHistory, setScanHistory] = useState([]);
-  useEffect(() => {
-    try {
-      const saved = localStorage.getItem("nse_scan_history");
-      if (saved) setScanHistory(JSON.parse(saved));
-    } catch {}
-  }, []);
-
-  function saveHistory(gainedList, lostList) {
-    const entry = {
-      ts: new Date().toISOString(),
-      gainers: gainedList.map(s => ({ sym: s.sym, ltp: s.ltp, changePct: s.changePct })),
-      losers:  lostList.map(s  => ({ sym: s.sym, ltp: s.ltp, changePct: s.changePct })),
-    };
-    setScanHistory(prev => {
-      const next = [entry, ...prev].slice(0, 10);
-      try { localStorage.setItem("nse_scan_history", JSON.stringify(next)); } catch {}
-      return next;
-    });
-  }
-
-  function clearHistory() {
-    setScanHistory([]);
-    try { localStorage.removeItem("nse_scan_history"); } catch {}
-  }
 
   // Fetch the F&O universe on mount
   const loadUniverse = useCallback(async () => {
@@ -1185,6 +1235,8 @@ export default function ScannerPage() {
     setRankedProgress({ done: 0, total: 0 });
     setConvictionGainers(null); setConvictionLosers(null); setConvictionErr(null);
     setConvictionProgress({ done: 0, total: 0 });
+    setTechGainers(null); setTechLosers(null); setTechErr(null);
+    setTechProgress({ done: 0, total: 0 });
     try {
       const keys = universe.map(s => s.key);
       const data = await fetchOhlc(keys, token);
@@ -1219,7 +1271,6 @@ export default function ScannerPage() {
       setGainers(enriched.slice(0, 20));
       setLosers(enriched.slice(-20).reverse());
       setScannedAt(new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }));
-      saveHistory(enriched.slice(0, 20), enriched.slice(-20).reverse());
       setShowTokenPanel(false);
     } catch (e) {
       setScanErr(e.message || "Scan failed");
@@ -1246,7 +1297,11 @@ export default function ScannerPage() {
       const isGainer = i < gainers.length;
       try {
         const signals = await countSignalsForStock(stock, selectedExpiry.iso, token);
-        const score = computeConvictionScore(stock, signals, isGainer);
+        // For gainers (bullish): CE open=low + PE open=high
+        // For losers (bearish):  PE open=low + CE open=high
+        const score = isGainer
+          ? signals.ceOpenEqLow + signals.peOpenEqHigh
+          : signals.peOpenEqLow + signals.ceOpenEqHigh;
         results.set(stock.key, { stock, signals, score, isGainer });
       } catch (e) {
         // If one stock fails, log it but keep going
@@ -1266,15 +1321,6 @@ export default function ScannerPage() {
     setRankedGainers(rGainers);
     setRankedLosers(rLosers);
     setRankedScanning(false);
-    const topG = rGainers[0];
-    const topL = rLosers[0];
-    sendNotification(
-      "Ranked scan complete",
-      [
-        topG && `Bullish: ${topG.stock.sym} (score ${topG.score})`,
-        topL && `Bearish: ${topL.stock.sym} (score ${topL.score})`,
-      ].filter(Boolean).join(" · ") || "No signals found"
-    );
   }, [gainers, losers, token, selectedExpiry, rankedScanning]);
 
   // Auto-trigger ranked scan when user switches to Ranked tab and we don't have data yet
@@ -1374,13 +1420,6 @@ export default function ScannerPage() {
 
       setConvictionGainers(gainerHits);
       setConvictionLosers(loserHits);
-      sendNotification(
-        "Conviction scan complete",
-        [
-          gainerHits.length && `${gainerHits.length} bullish (open=low)`,
-          loserHits.length  && `${loserHits.length} bearish (open=high)`,
-        ].filter(Boolean).join(" · ") || "No conviction signals"
-      );
     } catch (e) {
       setConvictionErr(e.message || "Conviction scan failed");
     } finally {
@@ -1394,6 +1433,89 @@ export default function ScannerPage() {
       runConvictionScan();
     }
   }, [tab, gainers, losers, futuresMap, convictionGainers, convictionScanning, convictionErr, runConvictionScan]);
+
+  // Technicals tab: scan top 20 gainers + 20 losers, fetch 5-min candles, filter by EMA + VWAP cross
+  const runTechnicalsScan = useCallback(async () => {
+    if (!gainers || !losers || !token) return;
+    if (techScanning) return;
+
+    setTechScanning(true);
+    setTechErr(null);
+
+    try {
+      const allStocks = [...gainers, ...losers].map((stock, i) => ({
+        stock,
+        isGainer: i < gainers.length,
+      }));
+
+      setTechProgress({ done: 0, total: allStocks.length });
+
+      const gainerHits = [];
+      const loserHits = [];
+
+      // Process sequentially with small concurrency batching to respect Upstox rate limits (~25/sec)
+      const BATCH_SIZE = 5;
+      for (let i = 0; i < allStocks.length; i += BATCH_SIZE) {
+        const batch = allStocks.slice(i, i + BATCH_SIZE);
+
+        const results = await Promise.all(
+          batch.map(async ({ stock, isGainer }) => {
+            try {
+              const candles = await fetchIntradayCandles(stock.key, token, 5);
+              const tech = analyzeIntraday(candles);
+              return { stock, isGainer, tech, err: null };
+            } catch (e) {
+              return { stock, isGainer, tech: null, err: e.message };
+            }
+          })
+        );
+
+        for (const r of results) {
+          if (!r.tech) continue;
+          const { close, ema20, ema200, vwap, cross } = r.tech;
+          if (close == null || vwap == null) continue;
+
+          if (r.isGainer) {
+            // Bullish: above 20 EMA, above 200 EMA (if available), just crossed ABOVE VWAP
+            const above20 = ema20 != null && close > ema20;
+            const above200 = ema200 == null || close > ema200; // if no 200 EMA yet, don't filter
+            const justCrossedUp = cross === "above";
+            if (above20 && above200 && justCrossedUp) {
+              gainerHits.push({ stock: r.stock, tech: r.tech });
+            }
+          } else {
+            // Bearish: below 20 EMA, below 200 EMA (if available), just crossed BELOW VWAP
+            const below20 = ema20 != null && close < ema20;
+            const below200 = ema200 == null || close < ema200;
+            const justCrossedDown = cross === "below";
+            if (below20 && below200 && justCrossedDown) {
+              loserHits.push({ stock: r.stock, tech: r.tech });
+            }
+          }
+        }
+
+        setTechProgress({ done: Math.min(i + BATCH_SIZE, allStocks.length), total: allStocks.length });
+      }
+
+      // Sort by % change magnitude (most extreme first)
+      gainerHits.sort((a, b) => b.stock.changePct - a.stock.changePct);
+      loserHits.sort((a, b) => a.stock.changePct - b.stock.changePct);
+
+      setTechGainers(gainerHits);
+      setTechLosers(loserHits);
+    } catch (e) {
+      setTechErr(e.message || "Technicals scan failed");
+    } finally {
+      setTechScanning(false);
+    }
+  }, [gainers, losers, token, techScanning]);
+
+  // Auto-trigger when user switches to technicals tab
+  useEffect(() => {
+    if (tab === "technicals" && gainers && losers && !techGainers && !techScanning && !techErr) {
+      runTechnicalsScan();
+    }
+  }, [tab, gainers, losers, techGainers, techScanning, techErr, runTechnicalsScan]);
 
   async function logout() {
     await fetch("/api/auth", { method: "DELETE" });
@@ -1472,19 +1594,6 @@ export default function ScannerPage() {
             }}>
               {scanning ? "scanning..." : universeLoading ? "loading universe..." : "scan now ↗"}
             </button>
-            <button
-              onClick={() => {
-                if (typeof Notification === "undefined") return;
-                if (notifPerm === "granted") return;
-                Notification.requestPermission().then(p => setNotifPerm(p));
-              }}
-              title={notifPerm === "granted" ? "Notifications on" : notifPerm === "denied" ? "Notifications blocked in browser" : "Enable notifications"}
-              style={{
-                fontSize: "13px", padding: "5px 8px", cursor: notifPerm === "denied" ? "not-allowed" : "pointer",
-                opacity: notifPerm === "denied" ? 0.4 : 1,
-                color: notifPerm === "granted" ? C.gain : C.muted,
-              }}
-            >{notifPerm === "granted" ? "🔔" : "🔕"}</button>
             <button onClick={logout} style={{
               fontSize: "11px", padding: "5px 10px", cursor: "pointer", color: C.muted,
             }}>sign out</button>
@@ -1540,7 +1649,7 @@ export default function ScannerPage() {
             gCount={gainers?.length} lCount={losers?.length}
             rankedReady={rankedGainers ? rankedGainers.length + (rankedLosers?.length || 0) : null}
             convictionReady={convictionGainers ? convictionGainers.length + (convictionLosers?.length || 0) : null}
-            historyCount={scanHistory.length} />
+            techReady={techGainers ? techGainers.length + (techLosers?.length || 0) : null} />
 
           {/* Gainers / Losers tabs — simple list */}
           {(tab === "gainers" || tab === "losers") && (
@@ -1582,9 +1691,19 @@ export default function ScannerPage() {
             />
           )}
 
-          {/* History tab — past scan results stored in localStorage */}
-          {tab === "history" && (
-            <HistoryView history={scanHistory} onClear={clearHistory} />
+          {/* Technicals tab — EMA + VWAP cross filtering */}
+          {tab === "technicals" && (
+            <TechnicalsView
+              techGainers={techGainers}
+              techLosers={techLosers}
+              scanning={techScanning}
+              progress={techProgress}
+              err={techErr}
+              onRetry={runTechnicalsScan}
+              techTab={techTab}
+              setTechTab={setTechTab}
+              onSelect={(stock, list) => setSelected({ stock, list })}
+            />
           )}
         </>
       )}
