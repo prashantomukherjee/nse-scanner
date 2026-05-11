@@ -1160,13 +1160,148 @@ function TechnicalsView({ techGainers, techLosers, scanning, progress, err, onRe
   );
 }
 
-function TabBar({ tab, setTab, gCount, lCount, rankedReady, convictionReady, techReady }) {
+/* HistoryView — shows last 10 scan snapshots with sticky leader detection */
+function HistoryView({ scanHistory, historyTab, setHistoryTab, onSelect }) {
+  const isLoser = historyTab === "losers";
+
+  // Compute "sticky count" — how many snapshots each stock appears in
+  const stickyCount = {};
+  for (const snap of scanHistory) {
+    const list = isLoser ? snap.losers : snap.gainers;
+    for (const stock of list) {
+      stickyCount[stock.sym] = (stickyCount[stock.sym] || 0) + 1;
+    }
+  }
+
+  // Stocks appearing in 3+ scans are "sticky leaders"
+  const STICKY_THRESHOLD = 3;
+
+  return (
+    <div>
+      {/* Sub-tabs */}
+      <div style={{ display: "flex", gap: "8px", marginBottom: "14px", fontFamily: "var(--font-mono)" }}>
+        {[
+          { id: "gainers", label: "▲ gainers history" },
+          { id: "losers",  label: "▼ losers history" },
+        ].map(t => (
+          <button key={t.id} onClick={() => setHistoryTab(t.id)} style={{
+            background: historyTab === t.id ? C.surface : "transparent",
+            color: historyTab === t.id ? C.text : C.muted,
+            border: `0.5px solid ${historyTab === t.id ? C.text : C.border}`,
+            borderRadius: "var(--border-radius-md)",
+            padding: "5px 12px", fontSize: "12px",
+            fontWeight: historyTab === t.id ? 500 : 400,
+            cursor: "pointer",
+          }}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Description */}
+      <div style={{
+        fontSize: "11px", color: C.muted, fontFamily: "var(--font-mono)",
+        padding: "8px 12px", background: C.surface, borderRadius: "var(--border-radius-md)",
+        marginBottom: "12px", lineHeight: 1.5,
+      }}>
+        Top 5 {isLoser ? "losers" : "gainers"} from each of your last {scanHistory.length} scan{scanHistory.length === 1 ? "" : "s"} (newest first).
+        Stocks appearing in {STICKY_THRESHOLD}+ scans are marked as sticky leaders (consistent strength).
+      </div>
+
+      {/* Empty state */}
+      {scanHistory.length === 0 && (
+        <div style={{
+          padding: "2rem 0", textAlign: "center", color: C.hint,
+          fontFamily: "var(--font-mono)", fontSize: "12px",
+        }}>
+          <div style={{ fontSize: "24px", marginBottom: "8px", opacity: 0.3 }}>—</div>
+          No scan history yet.
+          <div style={{ fontSize: "10px", marginTop: "4px" }}>
+            Click "scan now" to start building history.
+          </div>
+        </div>
+      )}
+
+      {/* Snapshots */}
+      {scanHistory.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+          {scanHistory.map((snap, snapIdx) => {
+            const list = isLoser ? snap.losers : snap.gainers;
+            const accent   = isLoser ? C.loss : C.gain;
+            const accentBg = isLoser ? C.lossBg : C.gainBg;
+
+            return (
+              <div key={`${snap.at}-${snapIdx}`} style={{
+                background: C.card, border: `0.5px solid ${C.border}`,
+                borderRadius: "var(--border-radius-lg)", padding: "12px 14px",
+              }}>
+                {/* Timestamp header */}
+                <div style={{
+                  fontSize: "11px", color: C.muted, marginBottom: "10px",
+                  fontFamily: "var(--font-mono)",
+                  display: "flex", justifyContent: "space-between", alignItems: "center",
+                }}>
+                  <span>{snapIdx === 0 ? "latest · " : ""}scan @ {snap.at}</span>
+                  <span style={{ fontSize: "10px", opacity: 0.7 }}>#{scanHistory.length - snapIdx}</span>
+                </div>
+
+                {/* Top 5 list */}
+                <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                  {list.map((stock, i) => {
+                    const sticky = stickyCount[stock.sym] >= STICKY_THRESHOLD;
+                    return (
+                      <div key={stock.key} onClick={() => onSelect(stock, isLoser ? "losers" : "gainers")}
+                        style={{
+                          display: "flex", alignItems: "center", gap: "10px",
+                          padding: "6px 8px", borderRadius: "var(--border-radius-md)",
+                          background: sticky ? accentBg : "transparent",
+                          cursor: "pointer", fontSize: "12px",
+                          fontFamily: "var(--font-mono)",
+                        }}
+                        onMouseEnter={e => { if (!sticky) e.currentTarget.style.background = C.surface; }}
+                        onMouseLeave={e => { if (!sticky) e.currentTarget.style.background = "transparent"; }}
+                      >
+                        <span style={{ color: C.muted, width: "16px" }}>{i + 1}.</span>
+                        <span style={{ color: C.text, flex: 1, fontWeight: sticky ? 500 : 400 }}>
+                          {stock.sym}
+                          {sticky && (
+                            <span style={{
+                              marginLeft: "8px", fontSize: "9px", color: accent,
+                              padding: "2px 6px", background: C.card,
+                              borderRadius: "var(--border-radius-md)",
+                              border: `0.5px solid ${accent}`,
+                            }}>
+                              sticky × {stickyCount[stock.sym]}
+                            </span>
+                          )}
+                        </span>
+                        <span style={{ color: C.muted }}>₹{fmtINR(stock.ltp)}</span>
+                        <span style={{
+                          color: accent, fontWeight: 500, minWidth: "60px", textAlign: "right",
+                        }}>
+                          {stock.changePct >= 0 ? "+" : ""}{stock.changePct.toFixed(2)}%
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TabBar({ tab, setTab, gCount, lCount, rankedReady, convictionReady, techReady, historyCount }) {
   const tabs = [
     { id: "gainers",    label: "▲ gainers",       color: C.gain,     bg: C.gainBg, count: gCount },
     { id: "losers",     label: "▼ losers",        color: C.loss,     bg: C.lossBg, count: lCount },
     { id: "ranked",     label: "◆ ranked",        color: C.infoText, bg: C.infoBg, count: rankedReady },
     { id: "conviction", label: "◇ open=low/high", color: C.warnText, bg: C.warnBg, count: convictionReady },
     { id: "technicals", label: "◈ technicals",    color: C.text,     bg: C.surface, count: techReady },
+    { id: "history",    label: "⟲ history",       color: C.muted,    bg: C.surface, count: historyCount },
   ];
   return (
     <div style={{ display: "flex", borderBottom: `0.5px solid ${C.border}`, marginBottom: "1rem", fontFamily: "var(--font-mono)" }}>
@@ -1233,6 +1368,10 @@ export default function ScannerPage() {
   const [techProgress, setTechProgress] = useState({ done: 0, total: 0 });
   const [techErr, setTechErr] = useState(null);
   const [techTab, setTechTab] = useState("gainers");
+
+  // History tab state — array of past scan snapshots (max 10), each with timestamp + top 5 gainers + top 5 losers
+  const [scanHistory, setScanHistory] = useState([]);  // [{ at, gainers: [...], losers: [...] }, ...]
+  const [historyTab, setHistoryTab] = useState("gainers"); // sub-tab inside history
 
   // Expiry selector — current and next month only
   const expiryOptions = getMonthlyExpiries();
@@ -1302,9 +1441,24 @@ export default function ScannerPage() {
       });
 
       enriched.sort((a, b) => b.changePct - a.changePct);
-      setGainers(enriched.slice(0, 20));
-      setLosers(enriched.slice(-20).reverse());
-      setScannedAt(new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }));
+      const newGainers = enriched.slice(0, 20);
+      const newLosers  = enriched.slice(-20).reverse();
+      setGainers(newGainers);
+      setLosers(newLosers);
+      const stamp = new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" });
+      setScannedAt(stamp);
+
+      // Append top 5 gainers + losers to scan history (rolling window of 10)
+      const snapshot = {
+        at: stamp,
+        gainers: newGainers.slice(0, 5).map(s => ({ sym: s.sym, key: s.key, changePct: s.changePct, ltp: s.ltp })),
+        losers:  newLosers.slice(0, 5).map(s => ({ sym: s.sym, key: s.key, changePct: s.changePct, ltp: s.ltp })),
+      };
+      setScanHistory(prev => {
+        const next = [snapshot, ...prev];   // newest first
+        return next.slice(0, 10);            // keep max 10
+      });
+
       setShowTokenPanel(false);
     } catch (e) {
       setScanErr(e.message || "Scan failed");
@@ -1688,7 +1842,8 @@ export default function ScannerPage() {
             gCount={gainers?.length} lCount={losers?.length}
             rankedReady={rankedGainers ? rankedGainers.length + (rankedLosers?.length || 0) : null}
             convictionReady={convictionGainers ? convictionGainers.length + (convictionLosers?.length || 0) : null}
-            techReady={techGainers ? techGainers.length + (techLosers?.length || 0) : null} />
+            techReady={techGainers ? techGainers.length + (techLosers?.length || 0) : null}
+            historyCount={scanHistory.length || null} />
 
           {/* Gainers / Losers tabs — simple list */}
           {(tab === "gainers" || tab === "losers") && (
@@ -1741,6 +1896,16 @@ export default function ScannerPage() {
               onRetry={runTechnicalsScan}
               techTab={techTab}
               setTechTab={setTechTab}
+              onSelect={(stock, list) => setSelected({ stock, list })}
+            />
+          )}
+
+          {/* History tab — last 10 scan snapshots with sticky leader detection */}
+          {tab === "history" && (
+            <HistoryView
+              scanHistory={scanHistory}
+              historyTab={historyTab}
+              setHistoryTab={setHistoryTab}
               onSelect={(stock, list) => setSelected({ stock, list })}
             />
           )}
