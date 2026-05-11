@@ -85,12 +85,33 @@ async function fetchOptionOhlc(keys, token) {
 
 /* ── Technical analysis helpers ── */
 
-// Fetch 5-minute intraday candles for a single stock (today's session)
+// Fetch 5-minute intraday candles for TODAY's session only
 // Upstox returns array of [timestamp, open, high, low, close, volume, oi]
 async function fetchIntradayCandles(instrumentKey, token, intervalMinutes = 5) {
   const path = `/v3/historical-candle/intraday/${encodeURIComponent(instrumentKey)}/minutes/${intervalMinutes}`;
   const data = await callUpstox(path, token);
   return data?.candles || [];
+}
+
+// Fetch HISTORICAL 5-minute candles for the past N trading days
+// Used to seed rolling EMA so it's stable from market open onwards
+async function fetchHistoricalCandles(instrumentKey, token, intervalMinutes = 5, daysBack = 3) {
+  // Upstox historical-candle URL needs to/from dates in YYYY-MM-DD format
+  const today = new Date();
+  const toDate = new Date(today);
+  toDate.setDate(toDate.getDate() - 1); // yesterday (no overlap with intraday)
+  const fromDate = new Date(toDate);
+  fromDate.setDate(fromDate.getDate() - daysBack);
+
+  const fmt = (d) => d.toISOString().slice(0, 10);
+  const path = `/v3/historical-candle/${encodeURIComponent(instrumentKey)}/minutes/${intervalMinutes}/${fmt(toDate)}/${fmt(fromDate)}`;
+  try {
+    const data = await callUpstox(path, token);
+    return data?.candles || [];
+  } catch (e) {
+    // If historical fetch fails (weekend, holiday, etc.), gracefully return empty
+    return [];
+  }
 }
 
 // Compute Exponential Moving Average from an array of closing prices
@@ -129,19 +150,20 @@ function computeVWAPAtIndex(candles, idx) {
   return computeVWAP(candles.slice(0, idx + 1));
 }
 
-// Detect VWAP cross between last two candles
+// Detect VWAP cross between last two intraday candles
 // Returns 'above' if previous was below VWAP and current is above (bullish cross)
 //        'below' if previous was above VWAP and current is below (bearish cross)
 //        null   otherwise
-function detectVWAPCross(candles) {
-  if (!candles || candles.length < 2) return null;
-  const prev = candles[candles.length - 2];
-  const curr = candles[candles.length - 1];
+// Note: takes INTRADAY candles only (VWAP resets daily)
+function detectVWAPCross(intradayCandles) {
+  if (!intradayCandles || intradayCandles.length < 2) return null;
+  const prev = intradayCandles[intradayCandles.length - 2];
+  const curr = intradayCandles[intradayCandles.length - 1];
   const prevClose = prev[4], currClose = curr[4];
   if (prevClose == null || currClose == null) return null;
 
-  const prevVWAP = computeVWAPAtIndex(candles, candles.length - 2);
-  const currVWAP = computeVWAPAtIndex(candles, candles.length - 1);
+  const prevVWAP = computeVWAPAtIndex(intradayCandles, intradayCandles.length - 2);
+  const currVWAP = computeVWAPAtIndex(intradayCandles, intradayCandles.length - 1);
   if (prevVWAP == null || currVWAP == null) return null;
 
   const prevAbove = prevClose > prevVWAP;
@@ -152,23 +174,35 @@ function detectVWAPCross(candles) {
   return null;
 }
 
-// Run full technical analysis on one stock's intraday candles
-// Returns { close, ema20, ema50, vwap, cross, candles } — everything we need
-function analyzeIntraday(candles) {
-  if (!candles || candles.length === 0) return null;
-  // Upstox returns candles in DESCENDING order (newest first). Sort ascending so EMA/VWAP work correctly.
-  const sorted = [...candles].sort((a, b) => new Date(a[0]) - new Date(b[0]));
+// Run full technical analysis combining historical + today's candles
+// - EMA: computed on historical + intraday combined (rolling, stable from market open)
+// - VWAP: today's intraday candles only (resets daily)
+// - Cross: detected on intraday candles only
+function analyzeWithHistory(historicalCandles, intradayCandles) {
+  if (!intradayCandles || intradayCandles.length === 0) return null;
 
-  const closes = sorted.map(c => c[4]).filter(v => v != null);
-  if (closes.length < 2) return null;
+  // Sort ascending (oldest first) — Upstox returns descending
+  const sortAsc = (arr) => [...arr].sort((a, b) => new Date(a[0]) - new Date(b[0]));
+  const sortedHist = sortAsc(historicalCandles || []);
+  const sortedToday = sortAsc(intradayCandles);
+
+  // Combine for EMA: historical first, then today's candles (chronological order)
+  const allCandles = [...sortedHist, ...sortedToday];
+  const allCloses = allCandles.map(c => c[4]).filter(v => v != null);
+  if (allCloses.length < 2) return null;
+
+  // Current price is the last close of today's candles
+  const todayCloses = sortedToday.map(c => c[4]).filter(v => v != null);
+  const currentClose = todayCloses[todayCloses.length - 1];
 
   return {
-    close: closes[closes.length - 1],
-    ema20:  computeEMA(closes, 20),
-    ema50:  computeEMA(closes, 50),
-    vwap:   computeVWAP(sorted),
-    cross:  detectVWAPCross(sorted),
-    candleCount: sorted.length,
+    close: currentClose,
+    ema20:  computeEMA(allCloses, 20),  // rolling EMA across historical + today
+    ema50:  computeEMA(allCloses, 50),  // rolling EMA across historical + today
+    vwap:   computeVWAP(sortedToday),   // intraday VWAP only
+    cross:  detectVWAPCross(sortedToday), // cross on intraday candles only
+    candleCount: sortedToday.length,
+    historicalCount: sortedHist.length,
   };
 }
 
@@ -1083,7 +1117,7 @@ function TechnicalsView({ techGainers, techLosers, scanning, progress, err, onRe
             fontSize: "11px", color: C.muted, marginBottom: "8px",
             display: "flex", justifyContent: "space-between",
           }}>
-            <span>fetching 5-min candles for technical analysis...</span>
+            <span>fetching historical + 5-min candles for rolling EMA + VWAP analysis...</span>
             <span>{progress.done} / {progress.total}</span>
           </div>
           <div style={{
@@ -1454,15 +1488,20 @@ export default function ScannerPage() {
       const loserHits = [];
 
       // Process sequentially with small concurrency batching to respect Upstox rate limits (~25/sec)
-      const BATCH_SIZE = 5;
+      // Process in batches. We now make 2 API calls per stock (historical + intraday), so use smaller batches
+      const BATCH_SIZE = 3;
       for (let i = 0; i < allStocks.length; i += BATCH_SIZE) {
         const batch = allStocks.slice(i, i + BATCH_SIZE);
 
         const results = await Promise.all(
           batch.map(async ({ stock, isGainer }) => {
             try {
-              const candles = await fetchIntradayCandles(stock.key, token, 5);
-              const tech = analyzeIntraday(candles);
+              // Fetch both historical (past 3 days) and intraday (today) candles in parallel
+              const [historical, intraday] = await Promise.all([
+                fetchHistoricalCandles(stock.key, token, 5, 3),
+                fetchIntradayCandles(stock.key, token, 5),
+              ]);
+              const tech = analyzeWithHistory(historical, intraday);
               return { stock, isGainer, tech, err: null };
             } catch (e) {
               return { stock, isGainer, tech: null, err: e.message };
