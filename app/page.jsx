@@ -45,12 +45,12 @@ function moneyness(strike, spot) {
 }
 
 /* ── Open=low / Open=high signal detection ──
-   OPTIONS use a 2% tolerance: an option "opened at its low" if open is within 2%
+   OPTIONS use a 0.5% tolerance: an option "opened at its low" if open is within 0.5%
    of the low (scales correctly across cheap and expensive options).
-   EQUITY/FUTURES use a much tighter 0.2% tolerance — they're high-priced and the
+   EQUITY/FUTURES use a tighter 0.2% tolerance — they're high-priced and the
    conviction signal is meant to be strict (truly opened at the low/high).
    Dead strikes (high === low, i.e. no real trading) are excluded by the caller. */
-const SIGNAL_TOLERANCE_PCT = 0.02;        // 2% — for options
+const SIGNAL_TOLERANCE_PCT = 0.005;       // 0.5% — for options
 const EQUITY_TOLERANCE_PCT = 0.002;       // 0.2% — for equity & futures
 
 // Is this a "live" strike (actually traded today)? high must differ from low.
@@ -58,12 +58,12 @@ function isLiveStrike(o) {
   return o && o.open != null && o.high != null && o.low != null
     && Math.abs(o.high - o.low) >= 0.01;
 }
-// open within 2% of the day's low (options)
+// open within 0.5% of the day's low (options)
 function isOpenAtLow(o) {
   if (o.low == null || o.open == null || o.low <= 0) return false;
   return Math.abs(o.open - o.low) <= o.low * SIGNAL_TOLERANCE_PCT;
 }
-// open within 2% of the day's high (options)
+// open within 0.5% of the day's high (options)
 function isOpenAtHigh(o) {
   if (o.high == null || o.open == null || o.high <= 0) return false;
   return Math.abs(o.open - o.high) <= o.high * SIGNAL_TOLERANCE_PCT;
