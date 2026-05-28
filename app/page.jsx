@@ -45,25 +45,38 @@ function moneyness(strike, spot) {
 }
 
 /* ── Open=low / Open=high signal detection ──
-   Uses a 2% tolerance: an option "opened at its low" if open is within 2%
+   OPTIONS use a 2% tolerance: an option "opened at its low" if open is within 2%
    of the low (scales correctly across cheap and expensive options).
+   EQUITY/FUTURES use a much tighter 0.2% tolerance — they're high-priced and the
+   conviction signal is meant to be strict (truly opened at the low/high).
    Dead strikes (high === low, i.e. no real trading) are excluded by the caller. */
-const SIGNAL_TOLERANCE_PCT = 0.02; // 2%
+const SIGNAL_TOLERANCE_PCT = 0.02;        // 2% — for options
+const EQUITY_TOLERANCE_PCT = 0.002;       // 0.2% — for equity & futures
 
 // Is this a "live" strike (actually traded today)? high must differ from low.
 function isLiveStrike(o) {
   return o && o.open != null && o.high != null && o.low != null
     && Math.abs(o.high - o.low) >= 0.01;
 }
-// open within 2% of the day's low
+// open within 2% of the day's low (options)
 function isOpenAtLow(o) {
   if (o.low == null || o.open == null || o.low <= 0) return false;
   return Math.abs(o.open - o.low) <= o.low * SIGNAL_TOLERANCE_PCT;
 }
-// open within 2% of the day's high
+// open within 2% of the day's high (options)
 function isOpenAtHigh(o) {
   if (o.high == null || o.open == null || o.high <= 0) return false;
   return Math.abs(o.open - o.high) <= o.high * SIGNAL_TOLERANCE_PCT;
+}
+// open within 0.2% of the day's low (equity / futures — stricter)
+function isEqOpenAtLow(o) {
+  if (o.low == null || o.open == null || o.low <= 0) return false;
+  return Math.abs(o.open - o.low) <= o.low * EQUITY_TOLERANCE_PCT;
+}
+// open within 0.2% of the day's high (equity / futures — stricter)
+function isEqOpenAtHigh(o) {
+  if (o.high == null || o.open == null || o.high <= 0) return false;
+  return Math.abs(o.open - o.high) <= o.high * EQUITY_TOLERANCE_PCT;
 }
 
 /* ── Upstox API calls (all go through /api/upstox) ── */
@@ -1605,16 +1618,16 @@ export default function ScannerPage() {
         if (stock.open == null) continue;
 
         if (isGainer) {
-          // Bullish signal: BOTH equity and future have open ≈ day's low (within 2%)
-          const equityOpenEqLow = isOpenAtLow(stock);
-          const futureOpenEqLow = isOpenAtLow(futOhlc);
+          // Bullish signal: BOTH equity and future have open ≈ day's low (within 0.2%)
+          const equityOpenEqLow = isEqOpenAtLow(stock);
+          const futureOpenEqLow = isEqOpenAtLow(futOhlc);
           if (equityOpenEqLow && futureOpenEqLow) {
             gainerHits.push({ stock, futOhlc });
           }
         } else {
-          // Bearish signal: BOTH equity and future have open ≈ day's high (within 2%)
-          const equityOpenEqHigh = isOpenAtHigh(stock);
-          const futureOpenEqHigh = isOpenAtHigh(futOhlc);
+          // Bearish signal: BOTH equity and future have open ≈ day's high (within 0.2%)
+          const equityOpenEqHigh = isEqOpenAtHigh(stock);
+          const futureOpenEqHigh = isEqOpenAtHigh(futOhlc);
           if (equityOpenEqHigh && futureOpenEqHigh) {
             loserHits.push({ stock, futOhlc });
           }
