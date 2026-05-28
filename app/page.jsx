@@ -44,6 +44,28 @@ function moneyness(strike, spot) {
   return strike < spot ? "ITM" : "OTM";
 }
 
+/* ── Open=low / Open=high signal detection ──
+   Uses a 2% tolerance: an option "opened at its low" if open is within 2%
+   of the low (scales correctly across cheap and expensive options).
+   Dead strikes (high === low, i.e. no real trading) are excluded by the caller. */
+const SIGNAL_TOLERANCE_PCT = 0.02; // 2%
+
+// Is this a "live" strike (actually traded today)? high must differ from low.
+function isLiveStrike(o) {
+  return o && o.open != null && o.high != null && o.low != null
+    && Math.abs(o.high - o.low) >= 0.01;
+}
+// open within 2% of the day's low
+function isOpenAtLow(o) {
+  if (o.low == null || o.open == null || o.low <= 0) return false;
+  return Math.abs(o.open - o.low) <= o.low * SIGNAL_TOLERANCE_PCT;
+}
+// open within 2% of the day's high
+function isOpenAtHigh(o) {
+  if (o.high == null || o.open == null || o.high <= 0) return false;
+  return Math.abs(o.open - o.high) <= o.high * SIGNAL_TOLERANCE_PCT;
+}
+
 /* ── Upstox API calls (all go through /api/upstox) ── */
 async function callUpstox(path, token) {
   let res;
@@ -300,9 +322,9 @@ async function countSignalsForStock(stock, expiryIso, token) {
     const live = ohlcByKey[opt.instrument_key]?.live_ohlc;
     if (!live || live.open == null || live.low == null || live.high == null) return;
     // Skip dead strikes — high === low means no real trading happened
-    if (Math.abs(live.high - live.low) < 0.01) return;
-    const openEqLow  = Math.abs(live.open - live.low)  < 0.01;
-    const openEqHigh = Math.abs(live.open - live.high) < 0.01;
+    if (!isLiveStrike(live)) return;
+    const openEqLow  = isOpenAtLow(live);
+    const openEqHigh = isOpenAtHigh(live);
     if (type === "CE") {
       if (openEqLow)  ceOpenEqLow++;
       if (openEqHigh) ceOpenEqHigh++;
@@ -435,12 +457,10 @@ function OptionsChain({ rows }) {
   }
   function highlight(opt) {
     if (!opt || opt.open == null) return null;
-    // Skip dead strikes — if open, high, and low are ALL equal, the option didn't really trade
-    // (or had only one trade), so the open=low / open=high signal is meaningless
-    if (opt.high != null && opt.low != null
-        && Math.abs(opt.high - opt.low) < 0.01) return null;
-    if (Math.abs(opt.open - opt.low)  < 0.01) return "low";
-    if (Math.abs(opt.open - opt.high) < 0.01) return "high";
+    // Skip dead strikes — if high and low are equal, the option didn't really trade
+    if (!isLiveStrike(opt)) return null;
+    if (isOpenAtLow(opt))  return "low";
+    if (isOpenAtHigh(opt)) return "high";
     return null;
   }
   function bg(opt, f) {
@@ -608,9 +628,8 @@ function DetailPage({ stock, isLoser, token, selectedExpiry, onBack }) {
   useEffect(() => { loadChain(); }, [loadChain]);
 
   // Skip dead strikes — options where high === low never really traded
-  const isLive = (r) => r.open != null && r.high != null && r.low != null && Math.abs(r.high - r.low) >= 0.01;
-  const lowCnt  = chain?.filter(r => isLive(r) && Math.abs(r.open - r.low)  < 0.01).length ?? 0;
-  const highCnt = chain?.filter(r => isLive(r) && Math.abs(r.open - r.high) < 0.01).length ?? 0;
+  const lowCnt  = chain?.filter(r => isLiveStrike(r) && isOpenAtLow(r)).length ?? 0;
+  const highCnt = chain?.filter(r => isLiveStrike(r) && isOpenAtHigh(r)).length ?? 0;
   const strikesCnt = chain ? [...new Set(chain.map(r => r.strike))].length : 0;
 
   return (
@@ -1586,16 +1605,16 @@ export default function ScannerPage() {
         if (stock.open == null) continue;
 
         if (isGainer) {
-          // Bullish signal: BOTH equity and future have open === day's low
-          const equityOpenEqLow = Math.abs(stock.open - stock.low) < 0.01;
-          const futureOpenEqLow = Math.abs(futOhlc.open - futOhlc.low) < 0.01;
+          // Bullish signal: BOTH equity and future have open ≈ day's low (within 2%)
+          const equityOpenEqLow = isOpenAtLow(stock);
+          const futureOpenEqLow = isOpenAtLow(futOhlc);
           if (equityOpenEqLow && futureOpenEqLow) {
             gainerHits.push({ stock, futOhlc });
           }
         } else {
-          // Bearish signal: BOTH equity and future have open === day's high
-          const equityOpenEqHigh = Math.abs(stock.open - stock.high) < 0.01;
-          const futureOpenEqHigh = Math.abs(futOhlc.open - futOhlc.high) < 0.01;
+          // Bearish signal: BOTH equity and future have open ≈ day's high (within 2%)
+          const equityOpenEqHigh = isOpenAtHigh(stock);
+          const futureOpenEqHigh = isOpenAtHigh(futOhlc);
           if (equityOpenEqHigh && futureOpenEqHigh) {
             loserHits.push({ stock, futOhlc });
           }
