@@ -1193,13 +1193,23 @@ function TechnicalsView({ techGainers, techLosers, scanning, progress, err, onRe
 }
 
 /* HistoryView — shows last 10 scan snapshots with sticky leader detection */
-function HistoryView({ scanHistory, historyTab, setHistoryTab, onSelect }) {
-  const isLoser = historyTab === "losers";
+function HistoryView({ scanHistory, rankedHistory, historyTab, setHistoryTab, onSelect }) {
+  // Determine which mode we're in: regular (gainers/losers) or ranked (rankedGainers/rankedLosers)
+  const isRankedMode = historyTab === "rankedGainers" || historyTab === "rankedLosers";
+  const isLoser = historyTab === "losers" || historyTab === "rankedLosers";
+
+  // Pick the right history array based on mode
+  const activeHistory = isRankedMode ? rankedHistory : scanHistory;
 
   // Compute "sticky count" — how many snapshots each stock appears in
   const stickyCount = {};
-  for (const snap of scanHistory) {
-    const list = isLoser ? snap.losers : snap.gainers;
+  for (const snap of activeHistory) {
+    let list;
+    if (isRankedMode) {
+      list = isLoser ? snap.rLosers : snap.rGainers;
+    } else {
+      list = isLoser ? snap.losers : snap.gainers;
+    }
     for (const stock of list) {
       stickyCount[stock.sym] = (stickyCount[stock.sym] || 0) + 1;
     }
@@ -1210,11 +1220,13 @@ function HistoryView({ scanHistory, historyTab, setHistoryTab, onSelect }) {
 
   return (
     <div>
-      {/* Sub-tabs */}
-      <div style={{ display: "flex", gap: "8px", marginBottom: "14px", fontFamily: "var(--font-mono)" }}>
+      {/* Sub-tabs — now 4 options */}
+      <div style={{ display: "flex", gap: "8px", marginBottom: "14px", flexWrap: "wrap", fontFamily: "var(--font-mono)" }}>
         {[
-          { id: "gainers", label: "▲ gainers history" },
-          { id: "losers",  label: "▼ losers history" },
+          { id: "gainers",       label: "▲ gainers (top 5)" },
+          { id: "losers",        label: "▼ losers (top 5)" },
+          { id: "rankedGainers", label: "◆ ranked gainers (20)" },
+          { id: "rankedLosers",  label: "◆ ranked losers (20)" },
         ].map(t => (
           <button key={t.id} onClick={() => setHistoryTab(t.id)} style={{
             background: historyTab === t.id ? C.surface : "transparent",
@@ -1236,29 +1248,35 @@ function HistoryView({ scanHistory, historyTab, setHistoryTab, onSelect }) {
         padding: "8px 12px", background: C.surface, borderRadius: "var(--border-radius-md)",
         marginBottom: "12px", lineHeight: 1.5,
       }}>
-        Top 5 {isLoser ? "losers" : "gainers"} from each of your last {scanHistory.length} scan{scanHistory.length === 1 ? "" : "s"} (newest first).
-        Stocks appearing in {STICKY_THRESHOLD}+ scans are marked as sticky leaders (consistent strength).
+        {isRankedMode
+          ? `Full ranked ${isLoser ? "losers" : "gainers"} list (20 stocks each with signal counts) from your last ${activeHistory.length} ranked scan${activeHistory.length === 1 ? "" : "s"}.`
+          : `Top 5 ${isLoser ? "losers" : "gainers"} from each of your last ${activeHistory.length} scan${activeHistory.length === 1 ? "" : "s"} (newest first).`}
+        {" "}Stocks appearing in {STICKY_THRESHOLD}+ scans are marked as sticky leaders (consistent strength).
       </div>
 
       {/* Empty state */}
-      {scanHistory.length === 0 && (
+      {activeHistory.length === 0 && (
         <div style={{
           padding: "2rem 0", textAlign: "center", color: C.hint,
           fontFamily: "var(--font-mono)", fontSize: "12px",
         }}>
           <div style={{ fontSize: "24px", marginBottom: "8px", opacity: 0.3 }}>—</div>
-          No scan history yet.
+          No {isRankedMode ? "ranked " : ""}scan history yet.
           <div style={{ fontSize: "10px", marginTop: "4px" }}>
-            Click "scan now" to start building history.
+            {isRankedMode
+              ? "Open the ranked tab to start building ranked history."
+              : 'Click "scan now" to start building history.'}
           </div>
         </div>
       )}
 
       {/* Snapshots */}
-      {scanHistory.length > 0 && (
+      {activeHistory.length > 0 && (
         <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-          {scanHistory.map((snap, snapIdx) => {
-            const list = isLoser ? snap.losers : snap.gainers;
+          {activeHistory.map((snap, snapIdx) => {
+            const list = isRankedMode
+              ? (isLoser ? snap.rLosers : snap.rGainers)
+              : (isLoser ? snap.losers : snap.gainers);
             const accent   = isLoser ? C.loss : C.gain;
             const accentBg = isLoser ? C.lossBg : C.gainBg;
 
@@ -1274,10 +1292,10 @@ function HistoryView({ scanHistory, historyTab, setHistoryTab, onSelect }) {
                   display: "flex", justifyContent: "space-between", alignItems: "center",
                 }}>
                   <span>{snapIdx === 0 ? "latest · " : ""}scan @ {snap.at}</span>
-                  <span style={{ fontSize: "10px", opacity: 0.7 }}>#{scanHistory.length - snapIdx}</span>
+                  <span style={{ fontSize: "10px", opacity: 0.7 }}>#{activeHistory.length - snapIdx}</span>
                 </div>
 
-                {/* Top 5 list */}
+                {/* Stock list */}
                 <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
                   {list.map((stock, i) => {
                     const sticky = stickyCount[stock.sym] >= STICKY_THRESHOLD;
@@ -1293,7 +1311,7 @@ function HistoryView({ scanHistory, historyTab, setHistoryTab, onSelect }) {
                         onMouseEnter={e => { if (!sticky) e.currentTarget.style.background = C.surface; }}
                         onMouseLeave={e => { if (!sticky) e.currentTarget.style.background = "transparent"; }}
                       >
-                        <span style={{ color: C.muted, width: "16px" }}>{i + 1}.</span>
+                        <span style={{ color: C.muted, width: "20px" }}>{i + 1}.</span>
                         <span style={{ color: C.text, flex: 1, fontWeight: sticky ? 500 : 400 }}>
                           {stock.sym}
                           {sticky && (
@@ -1313,6 +1331,20 @@ function HistoryView({ scanHistory, historyTab, setHistoryTab, onSelect }) {
                         }}>
                           {stock.changePct >= 0 ? "+" : ""}{stock.changePct.toFixed(2)}%
                         </span>
+                        {/* Show signal counts only in ranked mode */}
+                        {isRankedMode && (
+                          <span style={{
+                            display: "flex", alignItems: "center", gap: "8px",
+                            fontSize: "10px", color: C.muted, marginLeft: "8px",
+                          }}>
+                            <span title="PE open=low">PE↓ <span style={{ color: C.gain }}>{stock.peOpenEqLow}</span></span>
+                            <span title="CE open=high">CE↑ <span style={{ color: C.loss }}>{stock.ceOpenEqHigh}</span></span>
+                            <span style={{
+                              background: C.surface, padding: "2px 6px",
+                              borderRadius: "var(--border-radius-md)", color: C.text, fontWeight: 500,
+                            }}>{stock.score}</span>
+                          </span>
+                        )}
                       </div>
                     );
                   })}
@@ -1404,6 +1436,10 @@ export default function ScannerPage() {
   // History tab state — array of past scan snapshots (max 10), each with timestamp + top 5 gainers + top 5 losers
   const [scanHistory, setScanHistory] = useState([]);  // [{ at, gainers: [...], losers: [...] }, ...]
   const [historyTab, setHistoryTab] = useState("gainers"); // sub-tab inside history
+
+  // Ranked tab history — captures the full ranked output (20 gainers + 20 losers) each time
+  // ranked scan completes. Keeps the last 5 snapshots.
+  const [rankedHistory, setRankedHistory] = useState([]);  // [{ at, rGainers: [...], rLosers: [...] }, ...]
 
   // Expiry selector — current and next month only
   const expiryOptions = getMonthlyExpiries();
@@ -1541,6 +1577,27 @@ export default function ScannerPage() {
     setRankedGainers(rGainers);
     setRankedLosers(rLosers);
     setRankedScanning(false);
+
+    // Capture ranked snapshot to history (rolling window of 5)
+    const stamp = new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" });
+    const compact = (r) => ({
+      sym: r.stock.sym,
+      key: r.stock.key,
+      changePct: r.stock.changePct,
+      ltp: r.stock.ltp,
+      score: r.score,
+      // Save signal counts so the history view can show them like the live ranked tab
+      peOpenEqLow:  r.signals?.peOpenEqLow  ?? 0,
+      ceOpenEqHigh: r.signals?.ceOpenEqHigh ?? 0,
+      ceOpenEqLow:  r.signals?.ceOpenEqLow  ?? 0,
+      peOpenEqHigh: r.signals?.peOpenEqHigh ?? 0,
+    });
+    const snapshot = {
+      at: stamp,
+      rGainers: rGainers.map(compact),
+      rLosers:  rLosers.map(compact),
+    };
+    setRankedHistory(prev => [snapshot, ...prev].slice(0, 5));
   }, [gainers, losers, token, selectedExpiry, rankedScanning]);
 
   // Auto-trigger ranked scan when user switches to Ranked tab and we don't have data yet
@@ -1875,7 +1932,7 @@ export default function ScannerPage() {
             rankedReady={rankedGainers ? rankedGainers.length + (rankedLosers?.length || 0) : null}
             convictionReady={convictionGainers ? convictionGainers.length + (convictionLosers?.length || 0) : null}
             techReady={techGainers ? techGainers.length + (techLosers?.length || 0) : null}
-            historyCount={scanHistory.length || null} />
+            historyCount={(scanHistory.length + rankedHistory.length) || null} />
 
           {/* Gainers / Losers tabs — simple list */}
           {(tab === "gainers" || tab === "losers") && (
@@ -1936,6 +1993,7 @@ export default function ScannerPage() {
           {tab === "history" && (
             <HistoryView
               scanHistory={scanHistory}
+              rankedHistory={rankedHistory}
               historyTab={historyTab}
               setHistoryTab={setHistoryTab}
               onSelect={(stock, list) => setSelected({ stock, list })}
