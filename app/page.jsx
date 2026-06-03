@@ -301,7 +301,7 @@ async function countSignalsForStock(stock, expiryIso, token) {
   // 3. Anchor strike = nearest to today's open price
   const anchorPrice = stock.open ?? stock.high ?? stock.low ?? stock.ltp;
   const allStrikes = [...new Set(allChain.map(r => r.strike_price))].sort((a, b) => a - b);
-  if (allStrikes.length === 0) return { ceOpenEqLow: 0, ceOpenEqHigh: 0, peOpenEqLow: 0, peOpenEqHigh: 0 };
+  if (allStrikes.length === 0) return { ceOpenEqLow: 0, ceOpenEqHigh: 0, peOpenEqLow: 0, peOpenEqHigh: 0, pcr: null };
   const anchor = allStrikes.reduce((best, s) =>
     Math.abs(s - anchorPrice) < Math.abs(best - anchorPrice) ? s : best, allStrikes[0]);
   const anchorIdx = allStrikes.indexOf(anchor);
@@ -320,15 +320,16 @@ async function countSignalsForStock(stock, expiryIso, token) {
     if (r.call_options?.instrument_key) optKeys.push(r.call_options.instrument_key);
     if (r.put_options?.instrument_key)  optKeys.push(r.put_options.instrument_key);
   });
-  if (optKeys.length === 0) return { ceOpenEqLow: 0, ceOpenEqHigh: 0, peOpenEqLow: 0, peOpenEqHigh: 0 };
+  if (optKeys.length === 0) return { ceOpenEqLow: 0, ceOpenEqHigh: 0, peOpenEqLow: 0, peOpenEqHigh: 0, pcr: null };
 
   // 6. Fetch OHLC for all those options in one call
   const ohlcData = await fetchOptionOhlc(optKeys, token);
   const ohlcByKey = {};
   Object.values(ohlcData).forEach(item => { ohlcByKey[item.instrument_token] = item; });
 
-  // 7. Count signals
+  // 7. Count signals + compute PCR from OI of selected strikes
   let ceOpenEqLow = 0, ceOpenEqHigh = 0, peOpenEqLow = 0, peOpenEqHigh = 0;
+  let totalCeOI = 0, totalPeOI = 0;
 
   const tally = (opt, type) => {
     if (!opt?.instrument_key) return;
@@ -350,9 +351,14 @@ async function countSignalsForStock(stock, expiryIso, token) {
   for (const r of selected) {
     tally(r.call_options, "CE");
     tally(r.put_options,  "PE");
+    // Accumulate OI for PCR (from the chain data we already have — no extra fetch)
+    if (r.call_options?.market_data?.oi != null) totalCeOI += r.call_options.market_data.oi;
+    if (r.put_options?.market_data?.oi  != null) totalPeOI += r.put_options.market_data.oi;
   }
 
-  return { ceOpenEqLow, ceOpenEqHigh, peOpenEqLow, peOpenEqHigh };
+  const pcr = totalCeOI > 0 ? totalPeOI / totalCeOI : null;
+
+  return { ceOpenEqLow, ceOpenEqHigh, peOpenEqLow, peOpenEqHigh, pcr, totalCeOI, totalPeOI };
 }
 
 /* ── Components ── */
@@ -1358,13 +1364,248 @@ function HistoryView({ scanHistory, rankedHistory, historyTab, setHistoryTab, on
   );
 }
 
-function TabBar({ tab, setTab, gCount, lCount, rankedReady, convictionReady, techReady, historyCount }) {
+/* ── Setup Score (pre-market checklist) ──
+   Combines PCR, gap, equity open=high/low, and CE/PE flow into a single 0-10 score
+   so you can quickly find the strongest directional setups across top 40 stocks. */
+function computeSetupScore(stock, signals, isGainer) {
+  // signals = { ceOpenEqLow, ceOpenEqHigh, peOpenEqLow, peOpenEqHigh, pcr }
+  // stock has { open, high, low, close (prevClose), changePct }
+  let score = 0;
+  const reasons = [];
+
+  // 1. PCR — most important signal (+3)
+  const pcr = signals?.pcr;
+  if (pcr != null) {
+    if (isGainer && pcr > 1.5) { score += 3; reasons.push("PCR > 1.5"); }
+    if (!isGainer && pcr < 0.5) { score += 3; reasons.push("PCR < 0.5"); }
+  }
+
+  // 2. Gap — overnight institutional sentiment (+1)
+  const prevClose = stock.close;
+  const gapPct = (prevClose && stock.open) ? ((stock.open - prevClose) / prevClose) * 100 : 0;
+  if (isGainer && gapPct > 2)   { score += 1; reasons.push(`gap up ${gapPct.toFixed(1)}%`); }
+  if (!isGainer && gapPct < -2) { score += 1; reasons.push(`gap down ${gapPct.toFixed(1)}%`); }
+
+  // 3. Equity opened at low/high (+2) — uses tight 0.2% tolerance for equity
+  if (isGainer && isEqOpenAtLow(stock))   { score += 2; reasons.push("equity open=low"); }
+  if (!isGainer && isEqOpenAtHigh(stock)) { score += 2; reasons.push("equity open=high"); }
+
+  // 4. Strong option-side count for the direction (+2)
+  const sigs = signals || {};
+  if (isGainer && (sigs.ceOpenEqLow ?? 0) > 5)  { score += 2; reasons.push(`${sigs.ceOpenEqLow} CE open=low`); }
+  if (!isGainer && (sigs.ceOpenEqHigh ?? 0) > 5) { score += 2; reasons.push(`${sigs.ceOpenEqHigh} CE open=high`); }
+
+  // 5. Strong opposite option-side count (+2)
+  if (isGainer && (sigs.peOpenEqHigh ?? 0) > 5) { score += 2; reasons.push(`${sigs.peOpenEqHigh} PE open=high`); }
+  if (!isGainer && (sigs.peOpenEqLow ?? 0) > 5) { score += 2; reasons.push(`${sigs.peOpenEqLow} PE open=low`); }
+
+  return { score, reasons, gapPct, pcr };
+}
+
+/* Card showing a stock with its setup score breakdown */
+function SetupScoreCard({ entry, rank, isLoser, onClick }) {
+  const accent   = isLoser ? C.loss : C.gain;
+  const accentBg = isLoser ? C.lossBg : C.gainBg;
+  const stock = entry.stock;
+  const { score, reasons, gapPct, pcr } = entry.setup;
+  const pct = stock.changePct ?? 0;
+
+  // Score badge color based on strength
+  const scoreColor = score >= 7 ? accent : score >= 4 ? C.text : C.muted;
+  const scoreBg    = score >= 7 ? accentBg : C.surface;
+
+  return (
+    <div onClick={onClick} style={{
+      background: C.card, border: `0.5px solid ${score >= 7 ? accent : C.border}`,
+      borderRadius: "var(--border-radius-lg)", padding: "14px 16px",
+      cursor: "pointer", transition: "border-color 0.15s",
+    }}
+    onMouseEnter={e => { if (score < 7) e.currentTarget.style.borderColor = "var(--color-border-primary)"; }}
+    onMouseLeave={e => { if (score < 7) e.currentTarget.style.borderColor = "var(--color-border-tertiary)"; }}
+    >
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px", marginBottom: "8px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+          <div style={{
+            width: "30px", height: "30px", borderRadius: "50%", background: scoreBg,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            fontSize: "13px", fontWeight: 600, color: scoreColor, flexShrink: 0,
+          }}>{score}</div>
+          <div>
+            <div style={{ fontSize: "14px", fontWeight: 500, color: C.text }}>
+              {stock.sym}
+              {score >= 7 && (
+                <span style={{
+                  marginLeft: "8px", fontSize: "9px", color: accent,
+                  padding: "2px 6px", background: accentBg,
+                  borderRadius: "var(--border-radius-md)",
+                  border: `0.5px solid ${accent}`,
+                }}>
+                  HIGH CONVICTION
+                </span>
+              )}
+            </div>
+            <div style={{ fontSize: "11px", color: C.muted, marginTop: "2px", fontFamily: "var(--font-mono)" }}>
+              ₹{fmtINR(stock.ltp)}&nbsp;·&nbsp;
+              <span style={{ color: accent }}>{pct >= 0 ? "+" : ""}{pct.toFixed(2)}%</span>
+              {pcr != null && <>&nbsp;·&nbsp;PCR <span style={{ color: C.text }}>{pcr.toFixed(2)}</span></>}
+              {gapPct !== 0 && <>&nbsp;·&nbsp;gap <span style={{ color: gapPct >= 0 ? C.gain : C.loss }}>{gapPct >= 0 ? "+" : ""}{gapPct.toFixed(2)}%</span></>}
+            </div>
+          </div>
+        </div>
+        <div style={{
+          background: scoreBg, color: scoreColor, borderRadius: "var(--border-radius-md)",
+          padding: "5px 11px", fontSize: "13px", fontWeight: 600,
+          fontFamily: "var(--font-mono)",
+        }}>
+          {score}/10
+        </div>
+      </div>
+
+      {/* Reasons */}
+      {reasons.length > 0 && (
+        <div style={{
+          display: "flex", flexWrap: "wrap", gap: "6px",
+          fontSize: "10px", fontFamily: "var(--font-mono)",
+        }}>
+          {reasons.map((r, i) => (
+            <span key={i} style={{
+              background: C.surface, color: C.text,
+              padding: "3px 8px", borderRadius: "var(--border-radius-md)",
+            }}>✓ {r}</span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* The Setup Score tab content — pre-market checklist with all top 40 scored */
+function SetupScoreView({ rankedGainers, rankedLosers, scanning, progress, err, onRetry, setupTab, setSetupTab, onSelect }) {
+  const isLoser = setupTab === "losers";
+  const rawList = isLoser ? rankedLosers : rankedGainers;
+
+  // Compute setup scores for each ranked entry, then sort by score descending
+  const scored = (rawList || [])
+    .filter(entry => entry.signals != null)
+    .map(entry => ({
+      stock: entry.stock,
+      setup: computeSetupScore(entry.stock, entry.signals, !isLoser),
+    }))
+    .sort((a, b) => b.setup.score - a.setup.score);
+
+  // Counts for sub-tab badges (only stocks with score >= 4 are worth showing as "candidates")
+  const gainerCount = (rankedGainers || [])
+    .filter(e => e.signals)
+    .filter(e => computeSetupScore(e.stock, e.signals, true).score >= 4).length;
+  const loserCount = (rankedLosers || [])
+    .filter(e => e.signals)
+    .filter(e => computeSetupScore(e.stock, e.signals, false).score >= 4).length;
+
+  return (
+    <div>
+      {/* Sub-tabs */}
+      <div style={{ display: "flex", gap: "8px", marginBottom: "14px", fontFamily: "var(--font-mono)" }}>
+        {[
+          { id: "gainers", label: "▲ bullish setups", count: gainerCount },
+          { id: "losers",  label: "▼ bearish setups", count: loserCount },
+        ].map(t => (
+          <button key={t.id} onClick={() => setSetupTab(t.id)} style={{
+            background: setupTab === t.id ? C.surface : "transparent",
+            color: setupTab === t.id ? C.text : C.muted,
+            border: `0.5px solid ${setupTab === t.id ? C.text : C.border}`,
+            borderRadius: "var(--border-radius-md)",
+            padding: "5px 12px", fontSize: "12px",
+            fontWeight: setupTab === t.id ? 500 : 400,
+            cursor: "pointer", display: "flex", alignItems: "center", gap: "6px",
+          }}>
+            {t.label}
+            {t.count != null && <span style={{ fontSize: "10px", opacity: 0.7 }}>({t.count})</span>}
+          </button>
+        ))}
+      </div>
+
+      {/* Description */}
+      <div style={{
+        fontSize: "11px", color: C.muted, fontFamily: "var(--font-mono)",
+        padding: "8px 12px", background: C.surface, borderRadius: "var(--border-radius-md)",
+        marginBottom: "10px", lineHeight: 1.5,
+      }}>
+        Pre-market checklist score (0-10) for each top-20 {isLoser ? "loser" : "gainer"}.
+        Score = PCR extreme (+3) + Gap {isLoser ? "down" : "up"} > 2% (+1) + equity open={isLoser ? "high" : "low"} (+2) +
+        CE/PE flow {">5"} on each side (+2 each). Stocks with score ≥ 7 = HIGH CONVICTION setups.
+      </div>
+
+      {/* Error */}
+      {err && (
+        <div style={{
+          padding: "10px 14px", background: C.lossBg, color: C.loss,
+          borderRadius: "var(--border-radius-md)", fontSize: "12px", marginBottom: "1rem",
+          display: "flex", justifyContent: "space-between", alignItems: "center",
+          fontFamily: "var(--font-mono)",
+        }}>
+          <span>Error: {err}</span>
+          <button onClick={onRetry} style={{ fontSize: "11px", padding: "4px 10px", cursor: "pointer" }}>retry</button>
+        </div>
+      )}
+
+      {/* Progress (shared with ranked scan) */}
+      {scanning && (
+        <div style={{ fontFamily: "var(--font-mono)" }}>
+          <div style={{
+            fontSize: "11px", color: C.muted, marginBottom: "8px",
+            display: "flex", justifyContent: "space-between",
+          }}>
+            <span>scanning option chains for setup scores...</span>
+            <span>{progress.done} / {progress.total}</span>
+          </div>
+          <div style={{
+            height: "4px", background: C.surface,
+            borderRadius: "var(--border-radius-md)", overflow: "hidden", marginBottom: "12px",
+          }}>
+            <div style={{
+              width: `${progress.total ? (progress.done / progress.total) * 100 : 0}%`,
+              height: "100%", background: C.text, transition: "width 0.3s",
+            }} />
+          </div>
+        </div>
+      )}
+
+      {/* Empty (no ranked data yet) */}
+      {!scanning && rawList == null && (
+        <div style={{
+          padding: "2rem 0", textAlign: "center", color: C.hint,
+          fontFamily: "var(--font-mono)", fontSize: "12px",
+        }}>
+          <div style={{ fontSize: "24px", marginBottom: "8px", opacity: 0.3 }}>—</div>
+          Open the ◆ ranked tab first to compute setup scores.
+          <div style={{ fontSize: "10px", marginTop: "4px" }}>
+            Setup scores reuse ranked tab data (PCR + signal counts).
+          </div>
+        </div>
+      )}
+
+      {/* List — sorted by score */}
+      {!scanning && scored.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+          {scored.map((entry, i) => (
+            <SetupScoreCard key={entry.stock.key} entry={entry} rank={i + 1}
+              isLoser={isLoser}
+              onClick={() => onSelect(entry.stock, isLoser ? "losers" : "gainers")} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TabBar({ tab, setTab, gCount, lCount, rankedReady, convictionReady, techReady, historyCount, setupReady }) {
   const tabs = [
     { id: "gainers",    label: "▲ gainers",       color: C.gain,     bg: C.gainBg, count: gCount },
     { id: "losers",     label: "▼ losers",        color: C.loss,     bg: C.lossBg, count: lCount },
     { id: "ranked",     label: "◆ ranked",        color: C.infoText, bg: C.infoBg, count: rankedReady },
     { id: "conviction", label: "◇ open=low/high", color: C.warnText, bg: C.warnBg, count: convictionReady },
     { id: "technicals", label: "◈ technicals",    color: C.text,     bg: C.surface, count: techReady },
+    { id: "setup",      label: "★ setup score",   color: C.text,     bg: C.surface, count: setupReady },
     { id: "history",    label: "⟲ history",       color: C.muted,    bg: C.surface, count: historyCount },
   ];
   return (
@@ -1440,6 +1681,9 @@ export default function ScannerPage() {
   // Ranked tab history — captures the full ranked output (20 gainers + 20 losers) each time
   // ranked scan completes. Keeps the last 5 snapshots.
   const [rankedHistory, setRankedHistory] = useState([]);  // [{ at, rGainers: [...], rLosers: [...] }, ...]
+
+  // Setup score tab — reuses ranked tab data + adds PCR/gap-based scoring
+  const [setupTab, setSetupTab] = useState("losers");  // bearish setups more common in F&O
 
   // Expiry selector — current and next month only
   const expiryOptions = getMonthlyExpiries();
@@ -1600,9 +1844,10 @@ export default function ScannerPage() {
     setRankedHistory(prev => [snapshot, ...prev].slice(0, 5));
   }, [gainers, losers, token, selectedExpiry, rankedScanning]);
 
-  // Auto-trigger ranked scan when user switches to Ranked tab and we don't have data yet
+  // Auto-trigger ranked scan when user switches to Ranked tab OR Setup tab
+  // (Setup tab reuses ranked data — PCR + signal counts)
   useEffect(() => {
-    if (tab === "ranked" && gainers && losers && !rankedGainers && !rankedScanning && !rankedErr) {
+    if ((tab === "ranked" || tab === "setup") && gainers && losers && !rankedGainers && !rankedScanning && !rankedErr) {
       runRankedScan();
     }
   }, [tab, gainers, losers, rankedGainers, rankedScanning, rankedErr, runRankedScan]);
@@ -1932,6 +2177,14 @@ export default function ScannerPage() {
             rankedReady={rankedGainers ? rankedGainers.length + (rankedLosers?.length || 0) : null}
             convictionReady={convictionGainers ? convictionGainers.length + (convictionLosers?.length || 0) : null}
             techReady={techGainers ? techGainers.length + (techLosers?.length || 0) : null}
+            setupReady={(rankedGainers || rankedLosers) ? (
+              [...(rankedGainers || []), ...(rankedLosers || [])]
+                .filter(e => e.signals)
+                .filter((e, i, arr) => {
+                  const isGainer = i < (rankedGainers?.length || 0);
+                  return computeSetupScore(e.stock, e.signals, isGainer).score >= 7;
+                }).length || null
+            ) : null}
             historyCount={(scanHistory.length + rankedHistory.length) || null} />
 
           {/* Gainers / Losers tabs — simple list */}
@@ -1985,6 +2238,21 @@ export default function ScannerPage() {
               onRetry={runTechnicalsScan}
               techTab={techTab}
               setTechTab={setTechTab}
+              onSelect={(stock, list) => setSelected({ stock, list })}
+            />
+          )}
+
+          {/* Setup Score tab — pre-market checklist combining all signals (reuses ranked data) */}
+          {tab === "setup" && (
+            <SetupScoreView
+              rankedGainers={rankedGainers}
+              rankedLosers={rankedLosers}
+              scanning={rankedScanning}
+              progress={rankedProgress}
+              err={rankedErr}
+              onRetry={runRankedScan}
+              setupTab={setupTab}
+              setSetupTab={setSetupTab}
               onSelect={(stock, list) => setSelected({ stock, list })}
             />
           )}
