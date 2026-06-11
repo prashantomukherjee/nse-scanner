@@ -1530,9 +1530,9 @@ function SetupScoreView({ rankedGainers, rankedLosers, scanning, progress, err, 
         padding: "8px 12px", background: C.surface, borderRadius: "var(--border-radius-md)",
         marginBottom: "10px", lineHeight: 1.5,
       }}>
-        Pre-market checklist score (0-10) for each top-20 {isLoser ? "loser" : "gainer"}.{" "}
-        Score {"="} PCR extreme (+3) + Gap {isLoser ? "down" : "up"} {">"} 2% (+1) + equity open{"="}{isLoser ? "high" : "low"} (+2) +{" "}
-        CE/PE flow {">"} 5 on each side (+2 each). Stocks with score {"≥"} 7 {"="} HIGH CONVICTION setups.
+        Pre-market checklist score (0-10) for each top-20 {isLoser ? "loser" : "gainer"}.
+        Score = PCR extreme (+3) + Gap {isLoser ? "down" : "up"} > 2% (+1) + equity open={isLoser ? "high" : "low"} (+2) +
+        CE/PE flow {">5"} on each side (+2 each). Stocks with score ≥ 7 = HIGH CONVICTION setups.
       </div>
 
       {/* Error */}
