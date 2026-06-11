@@ -50,6 +50,96 @@ function moneyness(strike, spot) {
    EQUITY/FUTURES use a tighter 0.2% tolerance — they're high-priced and the
    conviction signal is meant to be strict (truly opened at the low/high).
    Dead strikes (high === low, i.e. no real trading) are excluded by the caller. */
+/* ── NSE F&O Sector Mapping ──
+   Maps each F&O stock symbol to its primary sector. Used by the Sectors tab to
+   show which sectors are up/down on the day by averaging the % change of
+   constituent stocks present in the current scan.
+
+   These groupings reflect Nifty sectoral indices and common Indian market sectors.
+   Some stocks (e.g. RELIANCE) are diversified — listed under their largest segment. */
+const SECTORS = {
+  "Banking": [
+    "HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK", "KOTAKBANK", "INDUSINDBK",
+    "BANKBARODA", "PNB", "FEDERALBNK", "AUBANK", "BANDHANBNK", "RBLBANK",
+    "IDFCFIRSTB", "CANBK", "UNIONBANK", "INDIANB", "BANKINDIA", "PSUBNKBEES",
+  ],
+  "IT": [
+    "TCS", "INFY", "WIPRO", "HCLTECH", "TECHM", "LTIM", "LTM", "MPHASIS",
+    "PERSISTENT", "COFORGE", "TATAELXSI", "OFSS", "KPITTECH",
+  ],
+  "Pharma": [
+    "SUNPHARMA", "DRREDDY", "CIPLA", "DIVISLAB", "AUROPHARMA", "LUPIN",
+    "BIOCON", "TORNTPHARM", "ZYDUSLIFE", "ALKEM", "GLENMARK", "LAURUSLABS",
+    "GRANULES", "IPCALAB", "ABBOTINDIA", "MANKIND", "GLAND", "SYNGENE",
+  ],
+  "Auto": [
+    "MARUTI", "TATAMOTORS", "M&M", "BAJAJ-AUTO", "EICHERMOT", "HEROMOTOCO",
+    "TVSMOTOR", "ASHOKLEY", "BHARATFORG", "MOTHERSON", "BOSCHLTD", "BALKRISIND",
+    "MRF", "APOLLOTYRE", "ESCORTS", "EXIDEIND",
+  ],
+  "FMCG": [
+    "HINDUNILVR", "ITC", "NESTLEIND", "BRITANNIA", "DABUR", "MARICO", "GODREJCP",
+    "COLPAL", "TATACONSUM", "VBL", "UBL", "MCDOWELL-N", "PGHH", "EMAMILTD",
+  ],
+  "Metal": [
+    "TATASTEEL", "JSWSTEEL", "HINDALCO", "VEDL", "JINDALSTEL", "SAIL", "NMDC",
+    "COALINDIA", "NATIONALUM", "APLAPOLLO", "RATNAMANI", "HINDCOPPER", "WELCORP",
+  ],
+  "Oil & Gas": [
+    "RELIANCE", "ONGC", "IOC", "BPCL", "HINDPETRO", "GAIL", "PETRONET",
+    "GUJGASLTD", "IGL", "MGL", "OIL",
+  ],
+  "Cement": [
+    "ULTRACEMCO", "GRASIM", "SHREECEM", "AMBUJACEM", "ACC", "DALBHARAT",
+    "JKCEMENT", "RAMCOCEM", "INDIACEM",
+  ],
+  "Capital Goods": [
+    "LT", "SIEMENS", "ABB", "BHEL", "HAVELLS", "BEL", "CUMMINSIND",
+    "POLYCAB", "HONAUT", "GMRINFRA", "GMRAIRPORT", "THERMAX", "VOLTAS", "BLUESTARCO",
+    "ASTRAL", "APLLTD",
+  ],
+  "Financial Services": [
+    "BAJFINANCE", "BAJAJFINSV", "SBILIFE", "HDFCLIFE", "ICICIPRULI", "ICICIGI",
+    "LICI", "HDFCAMC", "MUTHOOTFIN", "MANAPPURAM", "CHOLAFIN", "PFC",
+    "RECLTD", "SBICARD", "PEL", "POONAWALLA", "L&TFH", "IRFC", "JIOFIN", "POLICYBZR",
+    "KALYANKJIL",
+  ],
+  "Power": [
+    "NTPC", "POWERGRID", "TATAPOWER", "ADANIPOWER", "ADANIENSOL", "ADANIGREEN",
+    "NHPC", "SJVN", "JSWENERGY", "TORNTPOWER", "CESC",
+  ],
+  "Consumer Durables": [
+    "TITAN", "DIXON", "VOLTAS", "WHIRLPOOL", "CROMPTON", "BAJAJELEC", "AMBER",
+    "RAJESHEXPO",
+  ],
+  "Telecom": [
+    "BHARTIARTL", "IDEA", "INDUSTOWER", "VODAFONE", "TATACOMM", "MTNL",
+  ],
+  "Realty": [
+    "DLF", "GODREJPROP", "OBEROIRLTY", "PRESTIGE", "BRIGADE", "PHOENIXLTD",
+    "LODHA", "SOBHA",
+  ],
+  "Chemicals": [
+    "PIDILITIND", "SRF", "UPL", "PIIND", "DEEPAKNTR", "TATACHEM", "AARTI",
+    "ATUL", "NAVINFLUOR", "ALKYLAMINE", "BASF", "GHCL", "FLUOROCHEM", "GVT&D",
+  ],
+  "Media & Entertainment": [
+    "ZEEL", "PVRINOX", "SUNTV", "DISHTV", "TV18BRDCST", "SAREGAMA", "NETWORK18",
+  ],
+  "Diversified": [
+    "ABCAPITAL", "PIRAMALENT", "ITDC", "IDEAS", "ITI", "IFCI",
+  ],
+};
+
+/* Reverse-lookup: symbol → sector. Built once at module load. */
+const SYM_TO_SECTOR = (() => {
+  const map = {};
+  for (const [sector, syms] of Object.entries(SECTORS)) {
+    for (const s of syms) map[s] = sector;
+  }
+  return map;
+})();
+
 const SIGNAL_TOLERANCE_PCT = 0.005;       // 0.5% — for options
 const EQUITY_TOLERANCE_PCT = 0.002;       // 0.2% — for equity & futures
 
@@ -1530,9 +1620,9 @@ function SetupScoreView({ rankedGainers, rankedLosers, scanning, progress, err, 
         padding: "8px 12px", background: C.surface, borderRadius: "var(--border-radius-md)",
         marginBottom: "10px", lineHeight: 1.5,
       }}>
-        Pre-market checklist score (0-10) for each top-20 {isLoser ? "loser" : "gainer"}.
-        Score = PCR extreme (+3) + Gap {isLoser ? "down" : "up"} &gt; 2% (+1) + equity open={isLoser ? "high" : "low"} (+2) +
-        CE/PE flow &gt;5 on each side (+2 each). Stocks with score ≥ 7 = HIGH CONVICTION setups.
+        Pre-market checklist score (0-10) for each top-20 {isLoser ? "loser" : "gainer"}.{" "}
+        Score {"="} PCR extreme (+3) + Gap {isLoser ? "down" : "up"} {">"} 2% (+1) + equity open{"="}{isLoser ? "high" : "low"} (+2) +{" "}
+        CE/PE flow {">"} 5 on each side (+2 each). Stocks with score {"≥"} 7 {"="} HIGH CONVICTION setups.
       </div>
 
       {/* Error */}
@@ -1598,13 +1688,186 @@ function SetupScoreView({ rankedGainers, rankedLosers, scanning, progress, err, 
   );
 }
 
+/* ── Sectors tab ──
+   Groups the full universe of stocks by sector, computes avg % change per sector,
+   and shows sectors sorted by performance. Each sector card lists top 3 leaders
+   and laggards within it. */
+function computeSectorStats(universe, ohlcByKey) {
+  // universe = [{ sym, key }, ...]
+  // ohlcByKey = { [instrumentKey]: { changePct, ltp, ... } }
+  // Group by sector
+  const sectorData = {};
+  for (const stock of universe) {
+    const sector = SYM_TO_SECTOR[stock.sym];
+    if (!sector) continue;  // skip stocks not in any mapped sector
+
+    const data = ohlcByKey[stock.key];
+    if (!data || data.changePct == null) continue;
+
+    if (!sectorData[sector]) sectorData[sector] = { stocks: [], avgChange: 0, count: 0 };
+    sectorData[sector].stocks.push({
+      sym: stock.sym, key: stock.key,
+      changePct: data.changePct, ltp: data.ltp,
+      open: data.open, high: data.high, low: data.low, close: data.close,
+    });
+  }
+
+  // Compute avg change per sector + sort constituents
+  const result = [];
+  for (const [sector, info] of Object.entries(sectorData)) {
+    if (info.stocks.length === 0) continue;
+    info.stocks.sort((a, b) => b.changePct - a.changePct);
+    const sum = info.stocks.reduce((s, x) => s + x.changePct, 0);
+    const avg = sum / info.stocks.length;
+    result.push({
+      sector,
+      avgChange: avg,
+      count: info.stocks.length,
+      leaders: info.stocks.slice(0, 3),         // top 3 gainers
+      laggards: info.stocks.slice(-3).reverse(), // bottom 3 (worst first)
+    });
+  }
+  result.sort((a, b) => b.avgChange - a.avgChange);
+  return result;
+}
+
+function SectorsView({ universe, ohlcByKey, scannedAt, onSelect }) {
+  const sectors = (universe && ohlcByKey) ? computeSectorStats(universe, ohlcByKey) : [];
+
+  if (sectors.length === 0) {
+    return (
+      <div style={{
+        padding: "2rem 0", textAlign: "center", color: C.hint,
+        fontFamily: "var(--font-mono)", fontSize: "12px",
+      }}>
+        <div style={{ fontSize: "24px", marginBottom: "8px", opacity: 0.3 }}>—</div>
+        Run a scan first to compute sector performance.
+      </div>
+    );
+  }
+
+  const upSectors = sectors.filter(s => s.avgChange > 0);
+  const downSectors = sectors.filter(s => s.avgChange < 0);
+
+  return (
+    <div>
+      {/* Header summary */}
+      <div style={{
+        fontSize: "11px", color: C.muted, fontFamily: "var(--font-mono)",
+        padding: "8px 12px", background: C.surface, borderRadius: "var(--border-radius-md)",
+        marginBottom: "12px", lineHeight: 1.5,
+      }}>
+        Sector performance based on average % change of F&O stocks in each sector
+        ({sectors.length} sectors · scanned @ {scannedAt}).
+        {" "}<span style={{ color: C.gain }}>{upSectors.length} up</span>,
+        {" "}<span style={{ color: C.loss }}>{downSectors.length} down</span>.
+      </div>
+
+      {/* Sectors list */}
+      <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+        {sectors.map(s => {
+          const isUp = s.avgChange >= 0;
+          const accent = isUp ? C.gain : C.loss;
+          const accentBg = isUp ? C.gainBg : C.lossBg;
+
+          return (
+            <div key={s.sector} style={{
+              background: C.card,
+              border: `0.5px solid ${C.border}`,
+              borderRadius: "var(--border-radius-lg)",
+              padding: "12px 14px",
+            }}>
+              {/* Sector header */}
+              <div style={{
+                display: "flex", alignItems: "center", justifyContent: "space-between",
+                marginBottom: "10px",
+              }}>
+                <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                  <div style={{
+                    background: accentBg, color: accent,
+                    padding: "4px 10px", borderRadius: "var(--border-radius-md)",
+                    fontSize: "12px", fontWeight: 600, fontFamily: "var(--font-mono)",
+                    minWidth: "70px", textAlign: "center",
+                  }}>
+                    {isUp ? "▲" : "▼"} {s.avgChange >= 0 ? "+" : ""}{s.avgChange.toFixed(2)}%
+                  </div>
+                  <div>
+                    <div style={{ fontSize: "14px", fontWeight: 500, color: C.text }}>
+                      {s.sector}
+                    </div>
+                    <div style={{ fontSize: "10px", color: C.muted, marginTop: "2px", fontFamily: "var(--font-mono)" }}>
+                      {s.count} stock{s.count === 1 ? "" : "s"}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Leaders + Laggards side by side */}
+              <div style={{
+                display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px",
+                fontSize: "11px", fontFamily: "var(--font-mono)",
+              }}>
+                {/* Leaders */}
+                <div>
+                  <div style={{ fontSize: "9px", color: C.muted, letterSpacing: "0.06em", marginBottom: "4px" }}>
+                    ▲ TOP IN SECTOR
+                  </div>
+                  {s.leaders.map(stock => (
+                    <div key={stock.key} onClick={() => onSelect(stock, "gainers")}
+                      style={{
+                        display: "flex", justifyContent: "space-between",
+                        padding: "3px 6px", borderRadius: "var(--border-radius-md)",
+                        cursor: "pointer",
+                      }}
+                      onMouseEnter={e => e.currentTarget.style.background = C.surface}
+                      onMouseLeave={e => e.currentTarget.style.background = "transparent"}
+                    >
+                      <span style={{ color: C.text }}>{stock.sym}</span>
+                      <span style={{ color: stock.changePct >= 0 ? C.gain : C.loss }}>
+                        {stock.changePct >= 0 ? "+" : ""}{stock.changePct.toFixed(2)}%
+                      </span>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Laggards */}
+                <div>
+                  <div style={{ fontSize: "9px", color: C.muted, letterSpacing: "0.06em", marginBottom: "4px" }}>
+                    ▼ BOTTOM IN SECTOR
+                  </div>
+                  {s.laggards.map(stock => (
+                    <div key={stock.key} onClick={() => onSelect(stock, "losers")}
+                      style={{
+                        display: "flex", justifyContent: "space-between",
+                        padding: "3px 6px", borderRadius: "var(--border-radius-md)",
+                        cursor: "pointer",
+                      }}
+                      onMouseEnter={e => e.currentTarget.style.background = C.surface}
+                      onMouseLeave={e => e.currentTarget.style.background = "transparent"}
+                    >
+                      <span style={{ color: C.text }}>{stock.sym}</span>
+                      <span style={{ color: stock.changePct >= 0 ? C.gain : C.loss }}>
+                        {stock.changePct >= 0 ? "+" : ""}{stock.changePct.toFixed(2)}%
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function TabBar({ tab, setTab, gCount, lCount, rankedReady, convictionReady, techReady, historyCount, setupReady }) {
   const tabs = [
     { id: "gainers",    label: "▲ gainers",       color: C.gain,     bg: C.gainBg, count: gCount },
     { id: "losers",     label: "▼ losers",        color: C.loss,     bg: C.lossBg, count: lCount },
     { id: "ranked",     label: "◆ ranked",        color: C.infoText, bg: C.infoBg, count: rankedReady },
     { id: "conviction", label: "◇ open=low/high", color: C.warnText, bg: C.warnBg, count: convictionReady },
-    { id: "technicals", label: "◈ technicals",    color: C.text,     bg: C.surface, count: techReady },
+    { id: "sectors",    label: "◫ sectors",       color: C.text,     bg: C.surface, count: null },
     { id: "setup",      label: "★ setup score",   color: C.text,     bg: C.surface, count: setupReady },
     { id: "history",    label: "⟲ history",       color: C.muted,    bg: C.surface, count: historyCount },
   ];
@@ -1676,6 +1939,8 @@ export default function ScannerPage() {
 
   // History tab state — array of past scan snapshots (max 10), each with timestamp + top 5 gainers + top 5 losers
   const [scanHistory, setScanHistory] = useState([]);  // [{ at, gainers: [...], losers: [...] }, ...]
+  // Full enriched universe (all ~213 F&O stocks with OHLC) — used by Sectors tab to compute sector averages
+  const [allEnriched, setAllEnriched] = useState(null);
   const [historyTab, setHistoryTab] = useState("gainers"); // sub-tab inside history
 
   // Ranked tab history — captures the full ranked output (20 gainers + 20 losers) each time
@@ -1757,6 +2022,7 @@ export default function ScannerPage() {
       const newLosers  = enriched.slice(-20).reverse();
       setGainers(newGainers);
       setLosers(newLosers);
+      setAllEnriched(enriched);  // keep ALL stocks for Sectors tab
       const stamp = new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" });
       setScannedAt(stamp);
 
@@ -2227,19 +2493,28 @@ export default function ScannerPage() {
             />
           )}
 
-          {/* Technicals tab — EMA + VWAP cross filtering */}
-          {tab === "technicals" && (
-            <TechnicalsView
-              techGainers={techGainers}
-              techLosers={techLosers}
-              scanning={techScanning}
-              progress={techProgress}
-              err={techErr}
-              onRetry={runTechnicalsScan}
-              techTab={techTab}
-              setTechTab={setTechTab}
-              onSelect={(stock, list) => setSelected({ stock, list })}
-            />
+          {/* Sectors tab — sector performance from full F&O universe */}
+          {tab === "sectors" && (
+            (() => {
+              // Build ohlcByKey from allEnriched for the sectors view
+              const ohlcByKey = {};
+              if (allEnriched) {
+                for (const s of allEnriched) {
+                  ohlcByKey[s.key] = {
+                    changePct: s.changePct, ltp: s.ltp,
+                    open: s.open, high: s.high, low: s.low, close: s.close,
+                  };
+                }
+              }
+              return (
+                <SectorsView
+                  universe={universe}
+                  ohlcByKey={ohlcByKey}
+                  scannedAt={scannedAt}
+                  onSelect={(stock, list) => setSelected({ stock, list })}
+                />
+              );
+            })()
           )}
 
           {/* Setup Score tab — pre-market checklist combining all signals (reuses ranked data) */}
